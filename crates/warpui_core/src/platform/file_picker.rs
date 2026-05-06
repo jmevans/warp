@@ -21,6 +21,7 @@ pub enum FileType {
     Image,
     Yaml,
     Markdown,
+    Json,
 }
 
 impl FileType {
@@ -30,6 +31,7 @@ impl FileType {
             FileType::Image => &["png", "jpg", "jpeg"],
             FileType::Yaml => &["yaml", "yml"],
             FileType::Markdown => &["md", "markdown"],
+            FileType::Json => &["json"],
         }
     }
 
@@ -39,6 +41,7 @@ impl FileType {
             FileType::Image => "Image",
             FileType::Yaml => "Yaml",
             FileType::Markdown => "Markdown",
+            FileType::Json => "JSON",
         }
     }
 }

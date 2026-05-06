@@ -2205,6 +2205,61 @@ impl BlocklistAIController {
         request_params.parent_agent_id = parent_agent_id;
         request_params.agent_name = agent_name;
 
+        // Populate conversation history from previous exchanges for direct-provider message building.
+        if let Some(conversation) = history_model
+            .as_ref(ctx)
+            .conversation(&request_input.conversation_id)
+        {
+            request_params.conversation_history = conversation
+                .all_exchanges()
+                .into_iter()
+                .filter_map(|exchange| {
+                    let (user_query, user_images) =
+                        exchange.input.iter().find_map(|input| match input {
+                            crate::ai::agent::AIAgentInput::UserQuery {
+                                query, context, ..
+                            } => {
+                                let images = context
+                                    .iter()
+                                    .filter_map(|ctx| match ctx {
+                                        crate::ai::agent::AIAgentContext::Image(image_ctx) => {
+                                            Some(crate::ai::agent::api::SerializedImage {
+                                                data_base64: image_ctx.data.clone(),
+                                                mime_type: image_ctx.mime_type.clone(),
+                                            })
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                Some((query.clone(), images))
+                            }
+                            _ => None,
+                        })?;
+                    let assistant_text = exchange
+                        .output_status
+                        .output()
+                        .map(|output| {
+                            output
+                                .get()
+                                .messages
+                                .iter()
+                                .map(|msg| format!("{msg}"))
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    if assistant_text.is_empty() {
+                        None
+                    } else {
+                        Some(crate::ai::agent::api::AgentExchangeSnapshot {
+                            user_query,
+                            assistant_text,
+                            user_images,
+                        })
+                    }
+                })
+                .collect();
+        }
+
         let server_conversation_token_for_identifiers =
             conversation_data.server_conversation_token.clone();
 

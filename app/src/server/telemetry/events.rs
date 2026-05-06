@@ -2368,6 +2368,44 @@ pub enum TelemetryEvent {
         /// The original error that was retried
         original_error: String,
     },
+    /// Emitted when a direct provider (BYO) request begins.
+    DirectProviderRequestStarted {
+        /// Provider kind (e.g. openai, anthropic, openai-compatible).
+        provider_kind: String,
+        /// SHA-256 hash of the provider endpoint origin.
+        endpoint_origin_hash: String,
+        /// SHA-256 hash of the provider model id.
+        model_id_hash: String,
+        /// Whether the provider is inferred as local-only (localhost, 127.x, etc.).
+        is_local: Option<bool>,
+    },
+    /// Emitted when a direct provider (BYO) request completes.
+    DirectProviderRequestCompleted {
+        /// Provider kind (e.g. openai, anthropic, openai-compatible).
+        provider_kind: String,
+        /// SHA-256 hash of the provider endpoint origin.
+        endpoint_origin_hash: String,
+        /// SHA-256 hash of the provider model id.
+        model_id_hash: String,
+        /// Whether the request succeeded or failed.
+        success: bool,
+        /// Error class if the request failed (e.g. AuthFailure, Timeout, Unknown).
+        error_class: Option<String>,
+        /// Duration of the HTTP request in milliseconds (first byte).
+        duration_ms: u64,
+        /// Total stream duration in milliseconds (all turns).
+        stream_duration_ms: Option<u64>,
+        /// HTTP status family (e.g. "2xx", "4xx", "5xx").
+        http_status_family: Option<String>,
+        /// Whether the provider is inferred as local-only (localhost, 127.x, etc.).
+        is_local: Option<bool>,
+        /// Prompt/input token count from the provider's usage metadata.
+        tokens_prompt: Option<u64>,
+        /// Completion/output token count from the provider's usage metadata.
+        tokens_completion: Option<u64>,
+        /// Total token count from the provider's usage metadata.
+        tokens_total: Option<u64>,
+    },
     GrepToolSucceeded,
     GrepToolFailed {
         queries: Option<Vec<String>>,
@@ -3917,6 +3955,44 @@ impl TelemetryEvent {
                 "retry_count": retry_count,
                 "original_error": original_error,
             })),
+            TelemetryEvent::DirectProviderRequestStarted {
+                provider_kind,
+                endpoint_origin_hash,
+                model_id_hash,
+                is_local,
+            } => Some(json!({
+                "provider_kind": provider_kind,
+                "endpoint_origin_hash": endpoint_origin_hash,
+                "model_id_hash": model_id_hash,
+                "is_local": is_local,
+            })),
+            TelemetryEvent::DirectProviderRequestCompleted {
+                provider_kind,
+                endpoint_origin_hash,
+                model_id_hash,
+                success,
+                error_class,
+                duration_ms,
+                stream_duration_ms,
+                http_status_family,
+                is_local,
+                tokens_prompt,
+                tokens_completion,
+                tokens_total,
+            } => Some(json!({
+                "provider_kind": provider_kind,
+                "endpoint_origin_hash": endpoint_origin_hash,
+                "model_id_hash": model_id_hash,
+                "success": success,
+                "error_class": error_class,
+                "duration_ms": duration_ms,
+                "stream_duration_ms": stream_duration_ms,
+                "http_status_family": http_status_family,
+                "is_local": is_local,
+                "tokens_prompt": tokens_prompt,
+                "tokens_completion": tokens_completion,
+                "tokens_total": tokens_total,
+            })),
             TelemetryEvent::GrepToolFailed {
                 queries,
                 path,
@@ -4930,6 +5006,8 @@ impl TelemetryEvent {
             | TelemetryEvent::FileExceededContextLimit { .. }
             | TelemetryEvent::AgentModeError { .. }
             | TelemetryEvent::AgentModeRequestRetrySucceeded { .. }
+            | TelemetryEvent::DirectProviderRequestStarted { .. }
+            | TelemetryEvent::DirectProviderRequestCompleted { .. }
             | TelemetryEvent::ToggleNaturalLanguageAutosuggestionsSetting { .. }
             | TelemetryEvent::ToggleSharedBlockTitleGenerationSetting { .. }
             | TelemetryEvent::ToggleGitOperationsAutogenSetting { .. }
@@ -5496,6 +5574,8 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::FileExceededContextLimit => EnablementState::Always,
             Self::AgentModeError => EnablementState::Always,
             Self::AgentModeRequestRetrySucceeded => EnablementState::Always,
+            Self::DirectProviderRequestStarted => EnablementState::Always,
+            Self::DirectProviderRequestCompleted => EnablementState::Always,
             Self::GrepToolSucceeded => EnablementState::Always,
             Self::GrepToolFailed => EnablementState::Always,
             Self::FileGlobToolSucceeded => EnablementState::Always,
@@ -6026,6 +6106,8 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::FileExceededContextLimit => "AgentMode.Code.FileExceededContextLimit",
             Self::AgentModeError => "AgentMode.Error",
             Self::AgentModeRequestRetrySucceeded => "AgentMode.RequestRetrySucceeded",
+            Self::DirectProviderRequestStarted => "AgentMode.DirectProvider.RequestStarted",
+            Self::DirectProviderRequestCompleted => "AgentMode.DirectProvider.RequestCompleted",
             Self::GrepToolSucceeded => "AgentMode.Grep.Succeeded",
             Self::GrepToolFailed => "AgentMode.Grep.Failed",
             Self::FileGlobToolSucceeded => "AgentMode.FileGlob.Succeeded",
@@ -6852,6 +6934,8 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::AgentModeRequestRetrySucceeded => {
                 "Agent Mode request succeeded after retrying following an initial error"
             }
+            Self::DirectProviderRequestStarted => "Direct provider request started",
+            Self::DirectProviderRequestCompleted => "Direct provider request completed",
             Self::GrepToolSucceeded => "The grep tool completed successfully",
             Self::GrepToolFailed => "The grep tool failed to complete",
             Self::FileGlobToolSucceeded => "The file glob tool completed successfully",

@@ -466,6 +466,7 @@ impl From<GqlTier> for Tier {
                 .map(From::from),
             multi_admin_policy: gql_tier.multi_admin_policy.map(From::from),
             ambient_agents_policy: gql_tier.ambient_agents_policy.map(From::from),
+            provider_policy: None, // TODO: populated when server adds providerPolicy to Tier
         }
     }
 }

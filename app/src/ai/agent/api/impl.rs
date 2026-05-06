@@ -7,7 +7,10 @@ use warp_multi_agent_api as api;
 
 use crate::server::server_api::ServerApi;
 
-use super::{convert_to::convert_input, ConvertToAPITypeError, RequestParams, ResponseStream};
+use super::{
+    convert_to::convert_input, direct_provider::generate_direct_provider_output,
+    ConvertToAPITypeError, RequestParams, ResponseStream,
+};
 
 pub async fn generate_multi_agent_output(
     server_api: Arc<ServerApi>,
@@ -20,7 +23,7 @@ pub async fn generate_multi_agent_output(
         .unwrap_or_else(|| get_supported_tools(&params));
     let supported_cli_agent_tools = get_supported_cli_agent_tools(&params);
     let mut logging_metadata = HashMap::new();
-    if let Some(metadata) = params.metadata {
+    if let Some(metadata) = &params.metadata {
         logging_metadata.insert(
             "is_autodetected_user_query".to_owned(),
             prost_types::Value {
@@ -49,6 +52,14 @@ pub async fn generate_multi_agent_output(
 
     if params.should_redact_secrets {
         redaction::redact_inputs(&mut params.input);
+    }
+
+    let should_use_direct_provider = match &params.resolved_provider {
+        Ok(provider) => provider.kind.is_direct(),
+        Err(_) => true,
+    };
+    if should_use_direct_provider {
+        return generate_direct_provider_output(params, cancellation_rx).await;
     }
 
     let mut api_keys = params.api_keys;

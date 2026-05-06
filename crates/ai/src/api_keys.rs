@@ -4,6 +4,8 @@ use warp_multi_agent_api as api;
 use warpui::{Entity, ModelContext, SingletonEntity};
 use warpui_extras::secure_storage::{self, AppContextExt};
 
+use crate::provider_registry::ProviderRegistry;
+
 const SECURE_STORAGE_KEY: &str = "AiApiKeys";
 
 /// Emitted when user-provided API keys are updated in-memory.
@@ -67,6 +69,13 @@ impl ApiKeyManager {
 
     pub fn keys(&self) -> &ApiKeys {
         &self.keys
+    }
+
+    pub fn provider_registry_from_legacy_keys(
+        &self,
+        existing: Option<ProviderRegistry>,
+    ) -> ProviderRegistry {
+        ProviderRegistry::from_existing(existing, &self.keys)
     }
 
     pub fn set_google_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {

@@ -26,14 +26,13 @@ use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
     AgentModeCodingPermissionsType, AgentModeCommandExecutionDenylist,
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
-    AwsBedrockCredentialsEnabled, CanUseWarpCreditsWithByok, CodeSettings, CodebaseContextEnabled,
-    FileBasedMcpEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
-    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
-    NaturalLanguageAutosuggestionsEnabled, OrchestrationEnabled, RuleSuggestionsEnabled,
-    SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
-    ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
-    ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
-    WarpDriveContextEnabled,
+    AwsBedrockCredentialsEnabled, CodeSettings, CodebaseContextEnabled, FileBasedMcpEnabled,
+    GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory, IntelligentAutosuggestionsEnabled,
+    MemoryEnabled, NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled,
+    OrchestrationEnabled, RuleSuggestionsEnabled, SharedBlockTitleGenerationEnabled,
+    ShouldRenderCLIAgentToolbar, ShouldRenderUseAgentToolbarForUserCommands,
+    ShouldShowOzUpdatesInZeroState, ShowAgentTips, ShowConversationHistory, ShowHintText,
+    ThinkingDisplayMode, VoiceInputEnabled, WarpDriveContextEnabled,
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
@@ -43,6 +42,18 @@ use crate::view_components::{
 };
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
 use ::ai::api_keys::{ApiKeyManager, ApiKeys};
+use ::ai::provider_import::{
+    import_provider, ExportedProviderProfile, ImportError, ProviderExportTemplate,
+};
+use ::ai::provider_registry::{
+    AuthConfig, AuthSource, CapabilitySetting, DiscoveredModel, DiscoveryStrategy,
+    ProviderCapabilities, ProviderDefaults, ProviderDiscovery, ProviderKind, ProviderPolicy,
+    ProviderProfile, ProviderRegistry, ProviderRegistryDefaults, LEGACY_ANTHROPIC_PROVIDER_ID,
+    LEGACY_OPENAI_PROVIDER_ID, WARP_HOSTED_PROVIDER_ID,
+};
+use ::ai::provider_validator::{
+    ProviderValidator, ValidationError, ValidationLevel, ValidationResult, ValidationStatus,
+};
 use enum_iterator::all;
 use itertools::Itertools;
 use regex::Regex;
@@ -52,6 +63,7 @@ use warp_core::channel::ChannelState;
 use warp_core::context_flag::ContextFlag;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::color::internal_colors;
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     Border, ChildView, ConstrainedBox, CornerRadius, CrossAxisAlignment, Dismiss, Expanded, Fill,
     HyperlinkLens, MainAxisAlignment, MainAxisSize, MouseStateHandle, Radius, Shrinkable, Text,
@@ -72,6 +84,7 @@ use warpui::{
     Action, AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
+use warpui_extras::secure_storage::AppContextExt as _;
 
 use super::execution_profile_view::{ExecutionProfileView, ExecutionProfileViewEvent};
 use super::settings_page::{render_custom_size_header, render_settings_info_banner};
@@ -114,6 +127,355 @@ impl AISubpage {
         }
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderDraftAuthMode {
+    None,
+    EnvApiKey,
+    KeychainApiKey,
+    KeychainBearerToken,
+}
+
+impl ProviderDraftAuthMode {
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::None => "No auth",
+            Self::EnvApiKey => "API key from env var",
+            Self::KeychainApiKey => "API key from keychain",
+            Self::KeychainBearerToken => "Bearer token from keychain",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderDraftField {
+    Id,
+    DisplayName,
+    BaseUrl,
+    Model,
+    EnvVar,
+    SecretKey,
+    // Defaults (stored as strings, parsed on save)
+    Temperature,
+    TopP,
+    MaxOutputTokens,
+    TimeoutMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderDraftCapability {
+    Tools,
+    Vision,
+    StructuredOutputs,
+    PromptCaching,
+    ReasoningControls,
+    ModelDiscovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderDraftPolicy {
+    AllowFallback,
+    RedactTelemetry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderDraftDefaultField {
+    Stream,
+    Temperature,
+    TopP,
+    MaxOutputTokens,
+    TimeoutMs,
+}
+
+/// Draft representation of a CapabilitySetting (auto/on/off).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilitySettingDraft {
+    Auto,
+    On,
+    Off,
+}
+
+impl CapabilitySettingDraft {
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+
+    fn to_capability_setting(&self) -> CapabilitySetting {
+        match self {
+            Self::Auto => CapabilitySetting::automatic(),
+            Self::On => CapabilitySetting::enabled(),
+            Self::Off => CapabilitySetting::disabled(),
+        }
+    }
+
+    fn from_capability_setting(cs: &CapabilitySetting) -> Self {
+        match cs {
+            CapabilitySetting::Automatic(_) => Self::Auto,
+            CapabilitySetting::Explicit(true) => Self::On,
+            CapabilitySetting::Explicit(false) => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderDraft {
+    /// When Some, we are editing an existing provider with this id.
+    /// When None, we are creating a new provider.
+    editing_provider_id: Option<String>,
+    id: String,
+    display_name: String,
+    kind: ProviderKind,
+    auth_mode: ProviderDraftAuthMode,
+    base_url: String,
+    model: String,
+    env_var: String,
+    secret_key: String,
+    // Capabilities
+    cap_tools: CapabilitySettingDraft,
+    cap_vision: CapabilitySettingDraft,
+    cap_structured_outputs: CapabilitySettingDraft,
+    cap_prompt_caching: CapabilitySettingDraft,
+    cap_reasoning_controls: CapabilitySettingDraft,
+    cap_model_discovery: CapabilitySettingDraft,
+    // Policy
+    allow_fallback: bool,
+    redact_telemetry: bool,
+    // Defaults
+    stream: bool,
+    temperature: String,
+    top_p: String,
+    max_output_tokens: String,
+    timeout_ms: String,
+}
+
+impl Default for ProviderDraft {
+    fn default() -> Self {
+        Self {
+            editing_provider_id: None,
+            id: "ollama-local".to_string(),
+            display_name: "Ollama local".to_string(),
+            kind: ProviderKind::OpenAICompatible,
+            auth_mode: ProviderDraftAuthMode::None,
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            model: String::new(),
+            env_var: String::new(),
+            secret_key: String::new(),
+            cap_tools: CapabilitySettingDraft::Auto,
+            cap_vision: CapabilitySettingDraft::Auto,
+            cap_structured_outputs: CapabilitySettingDraft::Auto,
+            cap_prompt_caching: CapabilitySettingDraft::Auto,
+            cap_reasoning_controls: CapabilitySettingDraft::Auto,
+            cap_model_discovery: CapabilitySettingDraft::Auto,
+            allow_fallback: false,
+            redact_telemetry: true,
+            stream: true,
+            temperature: String::new(),
+            top_p: String::new(),
+            max_output_tokens: String::new(),
+            timeout_ms: String::new(),
+        }
+    }
+}
+
+impl ProviderDraft {
+    fn from_profile(profile: &ProviderProfile) -> Self {
+        let (auth_mode, env_var, _secret_key) = match &profile.auth {
+            AuthConfig::None => (ProviderDraftAuthMode::None, String::new(), String::new()),
+            AuthConfig::ApiKey {
+                source: AuthSource::Env,
+                env_var: Some(ev),
+                ..
+            } => (ProviderDraftAuthMode::EnvApiKey, ev.clone(), String::new()),
+            AuthConfig::ApiKey {
+                source: AuthSource::Env,
+                ..
+            } => (
+                ProviderDraftAuthMode::EnvApiKey,
+                String::new(),
+                String::new(),
+            ),
+            AuthConfig::ApiKey {
+                source: AuthSource::Keychain,
+                ..
+            } => (
+                ProviderDraftAuthMode::KeychainApiKey,
+                String::new(),
+                String::new(),
+            ),
+            AuthConfig::BearerToken {
+                source: AuthSource::Keychain,
+                ..
+            } => (
+                ProviderDraftAuthMode::KeychainBearerToken,
+                String::new(),
+                String::new(),
+            ),
+            AuthConfig::BearerToken { .. } => {
+                (ProviderDraftAuthMode::None, String::new(), String::new())
+            }
+        };
+        Self {
+            editing_provider_id: Some(profile.id.clone()),
+            id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            kind: profile.kind.clone(),
+            auth_mode,
+            base_url: profile.base_url.clone(),
+            model: profile
+                .defaults
+                .model
+                .clone()
+                .or_else(|| profile.discovery.fallback_models.first().cloned())
+                .unwrap_or_default(),
+            env_var,
+            secret_key: String::new(),
+            cap_tools: CapabilitySettingDraft::from_capability_setting(&profile.capabilities.tools),
+            cap_vision: CapabilitySettingDraft::from_capability_setting(
+                &profile.capabilities.vision,
+            ),
+            cap_structured_outputs: CapabilitySettingDraft::from_capability_setting(
+                &profile.capabilities.structured_outputs,
+            ),
+            cap_prompt_caching: CapabilitySettingDraft::from_capability_setting(
+                &profile.capabilities.prompt_caching,
+            ),
+            cap_reasoning_controls: CapabilitySettingDraft::from_capability_setting(
+                &profile.capabilities.reasoning_controls,
+            ),
+            cap_model_discovery: CapabilitySettingDraft::from_capability_setting(
+                &profile.capabilities.model_discovery,
+            ),
+            allow_fallback: profile.policy.allow_fallback_to_warp_hosted,
+            redact_telemetry: profile.policy.redact_telemetry,
+            stream: profile.defaults.stream.unwrap_or(true),
+            temperature: profile
+                .defaults
+                .temperature
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            top_p: profile
+                .defaults
+                .top_p
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            max_output_tokens: profile
+                .defaults
+                .max_output_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            timeout_ms: profile
+                .defaults
+                .timeout_ms
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn is_editing(&self) -> bool {
+        self.editing_provider_id.is_some()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: self.cap_tools.to_capability_setting(),
+            vision: self.cap_vision.to_capability_setting(),
+            structured_outputs: self.cap_structured_outputs.to_capability_setting(),
+            prompt_caching: self.cap_prompt_caching.to_capability_setting(),
+            reasoning_controls: self.cap_reasoning_controls.to_capability_setting(),
+            model_discovery: self.cap_model_discovery.to_capability_setting(),
+        }
+    }
+
+    fn policy(&self) -> ProviderPolicy {
+        let mut policy = ProviderPolicy::for_kind(&self.kind);
+        policy.allow_fallback_to_warp_hosted = self.allow_fallback;
+        policy.redact_telemetry = self.redact_telemetry;
+        policy
+    }
+
+    fn defaults(&self) -> ProviderDefaults {
+        ProviderDefaults {
+            model: if self.model.trim().is_empty() {
+                None
+            } else {
+                Some(self.model.trim().to_string())
+            },
+            stream: Some(self.stream),
+            temperature: self.temperature.parse().ok(),
+            top_p: self.top_p.parse().ok(),
+            max_output_tokens: self.max_output_tokens.parse().ok(),
+            timeout_ms: self.timeout_ms.parse().ok(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ProviderValidationUiState {
+    Validating,
+    Discovering,
+    ValidationComplete(ValidationResult),
+    DiscoveryComplete(Vec<DiscoveredModel>),
+    DiscoveryFailed(ValidationError),
+}
+
+impl ProviderValidationUiState {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Validating => "Validating",
+            Self::Discovering => "Discovering models",
+            Self::ValidationComplete(result) => match result.status {
+                ValidationStatus::Success => "Validation succeeded",
+                ValidationStatus::Partial => "Validation partially succeeded",
+                ValidationStatus::Failed => "Validation failed",
+            },
+            Self::DiscoveryComplete(_) => "Model discovery succeeded",
+            Self::DiscoveryFailed(_) => "Model discovery failed",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Validating => {
+                "Checking reachability, credentials, and response shape.".to_string()
+            }
+            Self::Discovering => "Requesting model metadata from the provider.".to_string(),
+            Self::ValidationComplete(result) => {
+                let mut detail = match result.status {
+                    ValidationStatus::Success => {
+                        "Provider is reachable and compatible.".to_string()
+                    }
+                    ValidationStatus::Partial => {
+                        "Provider validation was inconclusive.".to_string()
+                    }
+                    ValidationStatus::Failed => "Provider validation failed.".to_string(),
+                };
+                if let Some(models) = &result.discovered_models {
+                    detail.push_str(&format!(" {} models discovered.", models.len()));
+                }
+                if let Some(error) = &result.error {
+                    detail.push_str(&format!(" {error}"));
+                }
+                detail
+            }
+            Self::DiscoveryComplete(models) => format!("{} models discovered.", models.len()),
+            Self::DiscoveryFailed(error) => format!("{error}"),
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        matches!(
+            self,
+            Self::ValidationComplete(ValidationResult {
+                status: ValidationStatus::Success,
+                ..
+            }) | Self::DiscoveryComplete(_)
+        )
+    }
+}
 use crate::ai::{AIRequestUsageModel, AIRequestUsageModelEvent};
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::server::telemetry::{
@@ -137,8 +499,7 @@ use crate::{TelemetryEvent, UserWorkspaces};
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ops::Not;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -455,6 +816,34 @@ pub struct AISettingsPageView {
     // Profile views
     profile_views: Vec<ViewHandle<ExecutionProfileView>>,
     add_profile_button: ViewHandle<ActionButton>,
+
+    provider_draft: ProviderDraft,
+    provider_validation_states: HashMap<String, ProviderValidationUiState>,
+    // Provider form editors — stored on view so save handler reads live buffer text
+    provider_id_editor: ViewHandle<EditorView>,
+    provider_display_name_editor: ViewHandle<EditorView>,
+    provider_base_url_editor: ViewHandle<EditorView>,
+    provider_model_editor: ViewHandle<EditorView>,
+    provider_env_var_editor: ViewHandle<EditorView>,
+    provider_secret_key_editor: ViewHandle<EditorView>,
+    provider_defaults_temperature_editor: ViewHandle<EditorView>,
+    provider_defaults_top_p_editor: ViewHandle<EditorView>,
+    provider_defaults_max_output_tokens_editor: ViewHandle<EditorView>,
+    provider_defaults_timeout_ms_editor: ViewHandle<EditorView>,
+
+    import_dialog_visible: bool,
+    import_json_text: String,
+    import_pending_template: Option<ProviderExportTemplate>,
+    import_collision: Option<(String, ImportCollisionAction)>,
+    import_secret_prompt: Option<ImportSecretPromptState>,
+    import_secret_value: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ImportSecretPromptState {
+    provider_id: String,
+    secret_hint: String,
 }
 
 impl AISettingsPageView {
@@ -1388,8 +1777,24 @@ impl AISettingsPageView {
             dropdown
         });
 
+        let provider_id_editor = Self::create_provider_id_editor(ctx);
+        let provider_display_name_editor = Self::create_provider_display_name_editor(ctx);
+        let provider_base_url_editor = Self::create_provider_base_url_editor(ctx);
+        let provider_model_editor = Self::create_provider_model_editor(ctx);
+        let provider_env_var_editor = Self::create_provider_env_var_editor(ctx);
+        let provider_secret_key_editor = Self::create_provider_secret_key_editor(ctx);
+        let provider_defaults_temperature_editor = Self::create_provider_defaults_temperature_editor(ctx);
+        let provider_defaults_top_p_editor = Self::create_provider_defaults_top_p_editor(ctx);
+        let provider_defaults_max_output_tokens_editor = Self::create_provider_defaults_max_output_tokens_editor(ctx);
+        let provider_defaults_timeout_ms_editor = Self::create_provider_defaults_timeout_ms_editor(ctx);
+
         Self {
-            page: Self::build_page(None, ctx),
+            page: Self::build_page(None, ctx,
+                &provider_id_editor, &provider_display_name_editor, &provider_base_url_editor,
+                &provider_model_editor, &provider_env_var_editor, &provider_secret_key_editor,
+                &provider_defaults_temperature_editor, &provider_defaults_top_p_editor,
+                &provider_defaults_max_output_tokens_editor, &provider_defaults_timeout_ms_editor,
+            ),
             active_subpage: None,
             voice_input_toggle_key_dropdown,
             autodetection_denylist_editor,
@@ -1433,6 +1838,24 @@ impl AISettingsPageView {
             conversation_layout_dropdown,
             profile_views,
             add_profile_button,
+            provider_draft: ProviderDraft::default(),
+            provider_validation_states: HashMap::new(),
+            provider_id_editor,
+            provider_display_name_editor,
+            provider_base_url_editor,
+            provider_model_editor,
+            provider_env_var_editor,
+            provider_secret_key_editor,
+            provider_defaults_temperature_editor,
+            provider_defaults_top_p_editor,
+            provider_defaults_max_output_tokens_editor,
+            provider_defaults_timeout_ms_editor,
+            import_dialog_visible: false,
+            import_json_text: String::new(),
+            import_pending_template: None,
+            import_collision: None,
+            import_secret_prompt: None,
+            import_secret_value: String::new(),
         }
     }
 
@@ -1453,12 +1876,247 @@ impl AISettingsPageView {
     pub fn set_active_subpage(&mut self, subpage: Option<AISubpage>, ctx: &mut ViewContext<Self>) {
         if self.active_subpage != subpage {
             self.active_subpage = subpage;
-            self.page = Self::build_page(subpage, ctx);
+            self.page = Self::build_page(
+                subpage, ctx,
+                &self.provider_id_editor, &self.provider_display_name_editor,
+                &self.provider_base_url_editor, &self.provider_model_editor,
+                &self.provider_env_var_editor, &self.provider_secret_key_editor,
+                &self.provider_defaults_temperature_editor, &self.provider_defaults_top_p_editor,
+                &self.provider_defaults_max_output_tokens_editor, &self.provider_defaults_timeout_ms_editor,
+            );
             ctx.notify();
         }
     }
 
-    fn build_page(subpage: Option<AISubpage>, ctx: &mut ViewContext<Self>) -> PageType<Self> {
+    fn start_provider_validation(&mut self, provider_id: String, ctx: &mut ViewContext<Self>) {
+        let Some(profile) = provider_profile_for_action(&provider_id, ctx) else {
+            return;
+        };
+        let secrets = provider_secret_values(&profile, ApiKeyManager::as_ref(ctx).keys(), ctx);
+
+        self.provider_validation_states
+            .insert(provider_id.clone(), ProviderValidationUiState::Validating);
+        ctx.notify();
+
+        ctx.spawn(
+            async move {
+                let validator = ProviderValidator::new(reqwest::Client::new());
+                let result = validator
+                    .validate(&profile, ValidationLevel::Cheap, |ref_| {
+                        provider_secret_value(ref_, &secrets)
+                    })
+                    .await;
+                (provider_id, result)
+            },
+            |me, (provider_id, result), ctx| {
+                me.provider_validation_states.insert(
+                    provider_id.clone(),
+                    ProviderValidationUiState::ValidationComplete(result.clone()),
+                );
+                update_provider_registry(ctx, |registry| {
+                    registry.apply_validation_result(&provider_id, &result);
+                });
+                ctx.notify();
+            },
+        );
+    }
+
+    fn start_provider_discovery(&mut self, provider_id: String, ctx: &mut ViewContext<Self>) {
+        let Some(profile) = provider_profile_for_action(&provider_id, ctx) else {
+            return;
+        };
+        let secrets = provider_secret_values(&profile, ApiKeyManager::as_ref(ctx).keys(), ctx);
+
+        self.provider_validation_states
+            .insert(provider_id.clone(), ProviderValidationUiState::Discovering);
+        ctx.notify();
+
+        ctx.spawn(
+            async move {
+                let validator = ProviderValidator::new(reqwest::Client::new());
+                let result = validator
+                    .discover_models(&profile, |ref_| provider_secret_value(ref_, &secrets))
+                    .await;
+                (provider_id, result)
+            },
+            |me, (provider_id, result), ctx| {
+                match result {
+                    Ok(models) => {
+                        me.provider_validation_states.insert(
+                            provider_id.clone(),
+                            ProviderValidationUiState::DiscoveryComplete(models.clone()),
+                        );
+                        update_provider_registry(ctx, |registry| {
+                            registry.apply_discovered_models(&provider_id, models);
+                        });
+                    }
+                    Err(error) => {
+                        me.provider_validation_states.insert(
+                            provider_id,
+                            ProviderValidationUiState::DiscoveryFailed(error),
+                        );
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    fn process_provider_import_template(
+        &mut self,
+        template: ProviderExportTemplate,
+        collision_resolution: Option<(String, ImportCollisionAction)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let registry = ApiKeyManager::as_ref(ctx).provider_registry_from_legacy_keys(Some(
+            AISettings::as_ref(ctx).provider_registry.value().clone(),
+        ));
+        let mut import_registry = registry.clone();
+        let mut imported_profiles = Vec::new();
+
+        for exported in &template.providers {
+            let mut exported = exported.clone();
+            if let Some((provider_id, action)) = &collision_resolution {
+                if &exported.id == provider_id {
+                    match action {
+                        ImportCollisionAction::Overwrite => {
+                            import_registry.providers.remove(provider_id);
+                        }
+                        ImportCollisionAction::Rename => {
+                            exported.id =
+                                unique_provider_id(&import_registry.providers, &exported.id);
+                            exported.display_name = format!("{} Import", exported.display_name);
+                        }
+                        ImportCollisionAction::Skip => continue,
+                    }
+                }
+            }
+
+            match import_provider(&exported, &import_registry) {
+                Ok(result) => {
+                    if result.needs_secret {
+                        self.import_pending_template =
+                            Some(ProviderExportTemplate::new(vec![exported.clone()]));
+                        self.import_collision = None;
+                        self.import_secret_prompt = Some(ImportSecretPromptState {
+                            provider_id: result.profile.id,
+                            secret_hint: result.secret_hint.unwrap_or_default(),
+                        });
+                        self.import_secret_value.clear();
+                        ctx.notify();
+                        return;
+                    }
+                    import_registry.upsert_provider(result.profile.clone());
+                    imported_profiles.push(result.profile);
+                }
+                Err(ImportError::IdCollision(provider_id)) => {
+                    self.import_pending_template = Some(template);
+                    self.import_collision = Some((provider_id, ImportCollisionAction::Skip));
+                    self.import_secret_prompt = None;
+                    ctx.notify();
+                    return;
+                }
+            }
+        }
+
+        update_provider_registry(ctx, |registry| {
+            for profile in imported_profiles {
+                registry.upsert_provider(profile);
+            }
+        });
+        self.import_dialog_visible = false;
+        self.import_json_text.clear();
+        self.import_pending_template = None;
+        self.import_collision = None;
+        self.import_secret_prompt = None;
+        self.import_secret_value.clear();
+        ctx.notify();
+    }
+
+    fn import_provider_secret(
+        &mut self,
+        template: &ProviderExportTemplate,
+        provider_id: &str,
+        secret_value: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(exported) = template
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+        else {
+            return;
+        };
+
+        let registry = ApiKeyManager::as_ref(ctx).provider_registry_from_legacy_keys(Some(
+            AISettings::as_ref(ctx).provider_registry.value().clone(),
+        ));
+        let Ok(result) = import_provider(exported, &registry) else {
+            return;
+        };
+        let mut profile = result.profile;
+        let secret_ref = match &mut profile.auth {
+            AuthConfig::ApiKey {
+                source: AuthSource::Keychain,
+                secret_ref,
+                ..
+            } => {
+                let ref_ = secret_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("keychain://warp/providers/{provider_id}"));
+                *secret_ref = Some(ref_.clone());
+                ref_
+            }
+            AuthConfig::BearerToken {
+                source: AuthSource::Keychain,
+                secret_ref,
+            } => {
+                if secret_ref.is_empty() {
+                    *secret_ref = format!("keychain://warp/providers/{provider_id}");
+                }
+                secret_ref.clone()
+            }
+            AuthConfig::None
+            | AuthConfig::ApiKey {
+                source: AuthSource::Env,
+                ..
+            }
+            | AuthConfig::BearerToken {
+                source: AuthSource::Env,
+                ..
+            } => return,
+        };
+
+        if let Err(error) = ctx.secure_storage().write_value(&secret_ref, secret_value) {
+            log::error!("Failed to store imported provider secret: {error:#}");
+            return;
+        }
+
+        update_provider_registry(ctx, |registry| {
+            registry.upsert_provider(profile);
+        });
+        self.import_dialog_visible = false;
+        self.import_json_text.clear();
+        self.import_pending_template = None;
+        self.import_collision = None;
+        self.import_secret_prompt = None;
+        self.import_secret_value.clear();
+    }
+
+    fn build_page(
+        subpage: Option<AISubpage>,
+        ctx: &mut ViewContext<Self>,
+        provider_id_editor: &ViewHandle<EditorView>,
+        provider_display_name_editor: &ViewHandle<EditorView>,
+        provider_base_url_editor: &ViewHandle<EditorView>,
+        provider_model_editor: &ViewHandle<EditorView>,
+        provider_env_var_editor: &ViewHandle<EditorView>,
+        provider_secret_key_editor: &ViewHandle<EditorView>,
+        provider_defaults_temperature_editor: &ViewHandle<EditorView>,
+        provider_defaults_top_p_editor: &ViewHandle<EditorView>,
+        provider_defaults_max_output_tokens_editor: &ViewHandle<EditorView>,
+        provider_defaults_timeout_ms_editor: &ViewHandle<EditorView>,
+    ) -> PageType<Self> {
         let ai_settings = AISettings::as_ref(ctx);
 
         let mut widgets: Vec<Box<dyn SettingsWidget<View = AISettingsPageView>>> = Vec::new();
@@ -1509,7 +2167,19 @@ impl AISettingsPageView {
                     widgets.push(Box::new(VoiceWidget::default()));
                 }
                 widgets.push(Box::new(CLIAgentWidget::default()));
-                widgets.push(Box::new(ApiKeysWidget::new(ctx)));
+                widgets.push(Box::new(ProvidersWidget::new(
+                    ctx,
+                    provider_id_editor.clone(),
+                    provider_display_name_editor.clone(),
+                    provider_base_url_editor.clone(),
+                    provider_model_editor.clone(),
+                    provider_env_var_editor.clone(),
+                    provider_secret_key_editor.clone(),
+                    provider_defaults_temperature_editor.clone(),
+                    provider_defaults_top_p_editor.clone(),
+                    provider_defaults_max_output_tokens_editor.clone(),
+                    provider_defaults_timeout_ms_editor.clone(),
+                )));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
                 widgets.push(Box::new(AgentAttributionWidget::default()));
                 widgets.push(Box::new(OtherAIWidget::default()));
@@ -1549,7 +2219,19 @@ impl AISettingsPageView {
                 if voice_supported {
                     widgets.push(Box::new(VoiceWidget::default()));
                 }
-                widgets.push(Box::new(ApiKeysWidget::new(ctx)));
+                widgets.push(Box::new(ProvidersWidget::new(
+                    ctx,
+                    provider_id_editor.clone(),
+                    provider_display_name_editor.clone(),
+                    provider_base_url_editor.clone(),
+                    provider_model_editor.clone(),
+                    provider_env_var_editor.clone(),
+                    provider_secret_key_editor.clone(),
+                    provider_defaults_temperature_editor.clone(),
+                    provider_defaults_top_p_editor.clone(),
+                    provider_defaults_max_output_tokens_editor.clone(),
+                    provider_defaults_timeout_ms_editor.clone(),
+                )));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
                 widgets.push(Box::new(AgentAttributionWidget::default()));
                 widgets.push(Box::new(OtherAIWidget::default()));
@@ -2176,6 +2858,67 @@ impl AISettingsPageView {
             })
             .collect()
     }
+
+    // ── Provider form editors ──────────────────────────────────────────────
+
+    fn create_provider_editor(ctx: &mut ViewContext<Self>, placeholder: &'static str, initial: &'static str) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text(placeholder, ctx);
+            editor.set_buffer_text(initial, ctx);
+            editor
+        });
+        editor
+    }
+
+    fn create_provider_id_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "Provider ID", "ollama-local")
+    }
+    fn create_provider_display_name_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "Display name", "Ollama local")
+    }
+    fn create_provider_base_url_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1")
+    }
+    fn create_provider_model_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "Model ID", "")
+    }
+    fn create_provider_env_var_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "Env var name", "")
+    }
+    fn create_provider_secret_key_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "Secret key", "")
+    }
+    fn create_provider_defaults_temperature_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "1.0", "")
+    }
+    fn create_provider_defaults_top_p_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "1.0", "")
+    }
+    fn create_provider_defaults_max_output_tokens_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "4096", "")
+    }
+    fn create_provider_defaults_timeout_ms_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        Self::create_provider_editor(ctx, "60000", "")
+    }
+
+    fn set_provider_editor(&self, editor: &ViewHandle<EditorView>, text: &str, ctx: &mut ViewContext<Self>) {
+        editor.update(ctx, |ed, ctx| ed.set_buffer_text(text, ctx));
+    }
 }
 
 impl View for AISettingsPageView {
@@ -2278,6 +3021,56 @@ pub enum AISettingsPageAction {
         pattern: String,
         agent: Option<CLIAgent>,
     },
+    SetProviderDraftField(ProviderDraftField, String),
+    SetProviderDraftKind(ProviderKind),
+    SetProviderDraftAuthMode(ProviderDraftAuthMode),
+    SetProviderDraftCapability(ProviderDraftCapability, CapabilitySettingDraft),
+    SetProviderDraftPolicy(ProviderDraftPolicy, bool),
+    SetProviderDraftDefault(ProviderDraftDefaultField, String),
+    SaveProviderDraft,
+    EditProvider(String),
+    CancelProviderEdit,
+    AddProvider,
+    ToggleProviderEnabled(String),
+    DeleteProvider(String),
+    DuplicateProvider(String),
+    ValidateProvider(String),
+    DiscoverProviderModels(String),
+    ProviderValidationCompleted {
+        provider_id: String,
+        result: ValidationResult,
+    },
+    ProviderDiscoveryCompleted {
+        provider_id: String,
+        result: Result<Vec<DiscoveredModel>, ValidationError>,
+    },
+    SetDefaultProvider {
+        provider_id: String,
+        model_id: String,
+    },
+    ExportProvider(String),
+    ExportAllProviders,
+    ShowImportDialog,
+    HideImportDialog,
+    SetImportJson(String),
+    SetImportSecretValue(String),
+    ExecuteImport,
+    ResolveImportCollision {
+        provider_id: String,
+        action: ImportCollisionAction,
+    },
+    SubmitImportSecret {
+        provider_id: String,
+        secret_value: String,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImportCollisionAction {
+    Overwrite,
+    Rename,
+    Skip,
 }
 
 impl From<&AISettingsPageAction> for LoginGatedFeature {
@@ -3022,6 +3815,394 @@ impl TypedActionView for AISettingsPageView {
                         .agent_attribution_enabled
                         .toggle_and_save_value(ctx));
                 });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftField(field, value) => {
+                match field {
+                    ProviderDraftField::Id => self.provider_draft.id = provider_id_from_text(value),
+                    ProviderDraftField::DisplayName => {
+                        self.provider_draft.display_name = value.trim().to_string();
+                    }
+                    ProviderDraftField::BaseUrl => {
+                        self.provider_draft.base_url = value.trim().to_string();
+                    }
+                    ProviderDraftField::Model => {
+                        self.provider_draft.model = value.trim().to_string();
+                    }
+                    ProviderDraftField::EnvVar => {
+                        self.provider_draft.env_var = value.trim().to_string();
+                    }
+                    ProviderDraftField::SecretKey => {
+                        self.provider_draft.secret_key = value.trim().to_string();
+                    }
+                    ProviderDraftField::Temperature => {
+                        self.provider_draft.temperature = value.trim().to_string();
+                    }
+                    ProviderDraftField::TopP => {
+                        self.provider_draft.top_p = value.trim().to_string();
+                    }
+                    ProviderDraftField::MaxOutputTokens => {
+                        self.provider_draft.max_output_tokens = value.trim().to_string();
+                    }
+                    ProviderDraftField::TimeoutMs => {
+                        self.provider_draft.timeout_ms = value.trim().to_string();
+                    }
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftKind(kind) => {
+                self.provider_draft.kind = kind.clone();
+                if self.provider_draft.base_url.is_empty() {
+                    self.provider_draft.base_url = default_base_url_for_kind(kind).to_string();
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftAuthMode(mode) => {
+                self.provider_draft.auth_mode = mode.clone();
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftCapability(cap, value) => {
+                match cap {
+                    ProviderDraftCapability::Tools => self.provider_draft.cap_tools = value.clone(),
+                    ProviderDraftCapability::Vision => {
+                        self.provider_draft.cap_vision = value.clone();
+                    }
+                    ProviderDraftCapability::StructuredOutputs => {
+                        self.provider_draft.cap_structured_outputs = value.clone();
+                    }
+                    ProviderDraftCapability::PromptCaching => {
+                        self.provider_draft.cap_prompt_caching = value.clone();
+                    }
+                    ProviderDraftCapability::ReasoningControls => {
+                        self.provider_draft.cap_reasoning_controls = value.clone();
+                    }
+                    ProviderDraftCapability::ModelDiscovery => {
+                        self.provider_draft.cap_model_discovery = value.clone();
+                    }
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftPolicy(policy, value) => {
+                match policy {
+                    ProviderDraftPolicy::AllowFallback => {
+                        self.provider_draft.allow_fallback = *value;
+                    }
+                    ProviderDraftPolicy::RedactTelemetry => {
+                        self.provider_draft.redact_telemetry = *value;
+                    }
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetProviderDraftDefault(field, value) => {
+                match field {
+                    ProviderDraftDefaultField::Stream => {
+                        self.provider_draft.stream = value == "true";
+                    }
+                    ProviderDraftDefaultField::Temperature => {
+                        self.provider_draft.temperature = value.trim().to_string();
+                    }
+                    ProviderDraftDefaultField::TopP => {
+                        self.provider_draft.top_p = value.trim().to_string();
+                    }
+                    ProviderDraftDefaultField::MaxOutputTokens => {
+                        self.provider_draft.max_output_tokens = value.trim().to_string();
+                    }
+                    ProviderDraftDefaultField::TimeoutMs => {
+                        self.provider_draft.timeout_ms = value.trim().to_string();
+                    }
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SaveProviderDraft => {
+                // Read live buffer text from editors so we always save what the user sees.
+                let mut draft = self.provider_draft.clone();
+                draft.id = self.provider_id_editor.as_ref(ctx).buffer_text(ctx);
+                draft.display_name = self.provider_display_name_editor.as_ref(ctx).buffer_text(ctx);
+                draft.base_url = self.provider_base_url_editor.as_ref(ctx).buffer_text(ctx);
+                draft.model = self.provider_model_editor.as_ref(ctx).buffer_text(ctx);
+                draft.env_var = self.provider_env_var_editor.as_ref(ctx).buffer_text(ctx);
+                draft.secret_key = self.provider_secret_key_editor.as_ref(ctx).buffer_text(ctx);
+                draft.temperature = self.provider_defaults_temperature_editor.as_ref(ctx).buffer_text(ctx);
+                draft.top_p = self.provider_defaults_top_p_editor.as_ref(ctx).buffer_text(ctx);
+                draft.max_output_tokens = self.provider_defaults_max_output_tokens_editor.as_ref(ctx).buffer_text(ctx);
+                draft.timeout_ms = self.provider_defaults_timeout_ms_editor.as_ref(ctx).buffer_text(ctx);
+
+                let api_keys = ApiKeyManager::as_ref(ctx).keys().clone();
+                let registry = AISettings::as_ref(ctx).provider_registry.value().clone();
+                let window_id = ctx.window_id();
+                let Some(new_registry) =
+                    provider_registry_with_draft(&draft, &api_keys, &registry, ctx)
+                else {
+                    crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            crate::view_components::DismissibleToast::error(
+                                "Could not save provider: check required fields (Provider ID, Base URL)".to_string(),
+                            ),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                    return;
+                };
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    if let Err(e) = settings.provider_registry.set_value(new_registry, ctx) {
+                        log::error!("Failed to save provider registry: {e:#}");
+                        crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_ephemeral_toast(
+                                crate::view_components::DismissibleToast::error(format!(
+                                    "Failed to save provider: {e}"
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
+                });
+                // Reset to create mode after save
+                self.provider_draft = ProviderDraft::default();
+                self.set_provider_editor(&self.provider_id_editor, "ollama-local", ctx);
+                self.set_provider_editor(&self.provider_display_name_editor, "Ollama local", ctx);
+                self.set_provider_editor(&self.provider_base_url_editor, "http://127.0.0.1:11434/v1", ctx);
+                self.set_provider_editor(&self.provider_model_editor, "", ctx);
+                self.set_provider_editor(&self.provider_env_var_editor, "", ctx);
+                self.set_provider_editor(&self.provider_secret_key_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_temperature_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_top_p_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_max_output_tokens_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_timeout_ms_editor, "", ctx);
+                crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        crate::view_components::DismissibleToast::success(
+                            "Provider saved successfully".to_string(),
+                        ),
+                        window_id,
+                        ctx,
+                    );
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::EditProvider(provider_id) => {
+                let Some(profile) = provider_profile_for_action(provider_id, ctx) else {
+                    return;
+                };
+                self.provider_draft = ProviderDraft::from_profile(&profile);
+                self.set_provider_editor(&self.provider_id_editor, &profile.id, ctx);
+                self.set_provider_editor(&self.provider_display_name_editor, &profile.display_name, ctx);
+                self.set_provider_editor(&self.provider_base_url_editor, &profile.base_url, ctx);
+                let model = profile.discovery.fallback_models.first().cloned().unwrap_or_default();
+                self.set_provider_editor(&self.provider_model_editor, &model, ctx);
+                self.set_provider_editor(&self.provider_env_var_editor, "", ctx);
+                self.set_provider_editor(&self.provider_secret_key_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_temperature_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_top_p_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_max_output_tokens_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_timeout_ms_editor, "", ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::CancelProviderEdit => {
+                self.provider_draft = ProviderDraft::default();
+                self.set_provider_editor(&self.provider_id_editor, "ollama-local", ctx);
+                self.set_provider_editor(&self.provider_display_name_editor, "Ollama local", ctx);
+                self.set_provider_editor(&self.provider_base_url_editor, "http://127.0.0.1:11434/v1", ctx);
+                self.set_provider_editor(&self.provider_model_editor, "", ctx);
+                self.set_provider_editor(&self.provider_env_var_editor, "", ctx);
+                self.set_provider_editor(&self.provider_secret_key_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_temperature_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_top_p_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_max_output_tokens_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_timeout_ms_editor, "", ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::AddProvider => {
+                self.provider_draft = ProviderDraft {
+                    editing_provider_id: None,
+                    ..ProviderDraft::default()
+                };
+                self.set_provider_editor(&self.provider_id_editor, "ollama-local", ctx);
+                self.set_provider_editor(&self.provider_display_name_editor, "Ollama local", ctx);
+                self.set_provider_editor(&self.provider_base_url_editor, "http://127.0.0.1:11434/v1", ctx);
+                self.set_provider_editor(&self.provider_model_editor, "", ctx);
+                self.set_provider_editor(&self.provider_env_var_editor, "", ctx);
+                self.set_provider_editor(&self.provider_secret_key_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_temperature_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_top_p_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_max_output_tokens_editor, "", ctx);
+                self.set_provider_editor(&self.provider_defaults_timeout_ms_editor, "", ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleProviderEnabled(provider_id) => {
+                update_provider_registry(ctx, |registry| {
+                    if let Some(provider) = registry.providers.get_mut(provider_id) {
+                        if provider.id != WARP_HOSTED_PROVIDER_ID {
+                            provider.enabled = !provider.enabled;
+                        }
+                    }
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::DeleteProvider(provider_id) => {
+                update_provider_registry(ctx, |registry| {
+                    if provider_id != WARP_HOSTED_PROVIDER_ID {
+                        registry.providers.remove(provider_id);
+                        if registry.defaults.agent_provider.as_deref() == Some(provider_id) {
+                            registry.defaults.agent_provider =
+                                Some(WARP_HOSTED_PROVIDER_ID.to_string());
+                            registry.defaults.agent_model = Some("auto".to_string());
+                        }
+                    }
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::DuplicateProvider(provider_id) => {
+                update_provider_registry(ctx, |registry| {
+                    let Some(provider) = registry.providers.get(provider_id).cloned() else {
+                        return;
+                    };
+                    let mut copy = provider.clone();
+                    copy.id =
+                        unique_provider_id(&registry.providers, &format!("{}-copy", provider.id));
+                    copy.display_name = format!("{} Copy", provider.display_name);
+                    copy.enabled = false;
+                    registry.upsert_provider(copy);
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ValidateProvider(provider_id) => {
+                self.start_provider_validation(provider_id.clone(), ctx);
+            }
+            AISettingsPageAction::DiscoverProviderModels(provider_id) => {
+                self.start_provider_discovery(provider_id.clone(), ctx);
+            }
+            AISettingsPageAction::ProviderValidationCompleted {
+                provider_id,
+                result,
+            } => {
+                self.provider_validation_states.insert(
+                    provider_id.clone(),
+                    ProviderValidationUiState::ValidationComplete(result.clone()),
+                );
+                update_provider_registry(ctx, |registry| {
+                    registry.apply_validation_result(provider_id, result);
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ProviderDiscoveryCompleted {
+                provider_id,
+                result,
+            } => {
+                match result {
+                    Ok(models) => {
+                        self.provider_validation_states.insert(
+                            provider_id.clone(),
+                            ProviderValidationUiState::DiscoveryComplete(models.clone()),
+                        );
+                        update_provider_registry(ctx, |registry| {
+                            registry.apply_discovered_models(provider_id, models.clone());
+                        });
+                    }
+                    Err(error) => {
+                        self.provider_validation_states.insert(
+                            provider_id.clone(),
+                            ProviderValidationUiState::DiscoveryFailed(error.clone()),
+                        );
+                    }
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetDefaultProvider {
+                provider_id,
+                model_id,
+            } => {
+                update_provider_registry(ctx, |registry| {
+                    registry.defaults = ProviderRegistryDefaults {
+                        agent_provider: Some(provider_id.clone()),
+                        agent_model: Some(model_id.clone()),
+                    };
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ExportProvider(provider_id) => {
+                let Some(provider) = provider_profile_for_action(provider_id, ctx) else {
+                    return;
+                };
+                let template =
+                    ProviderExportTemplate::new(vec![ExportedProviderProfile::from(&provider)]);
+                if let Ok(json) = template.to_json() {
+                    ctx.clipboard().write(ClipboardContent::plain_text(json));
+                }
+            }
+            AISettingsPageAction::ExportAllProviders => {
+                let registry = ApiKeyManager::as_ref(ctx).provider_registry_from_legacy_keys(Some(
+                    AISettings::as_ref(ctx).provider_registry.value().clone(),
+                ));
+                let providers = registry
+                    .providers
+                    .values()
+                    .filter(|provider| provider.id != WARP_HOSTED_PROVIDER_ID)
+                    .map(ExportedProviderProfile::from)
+                    .collect();
+                let template = ProviderExportTemplate::new(providers);
+                if let Ok(json) = template.to_json() {
+                    ctx.clipboard().write(ClipboardContent::plain_text(json));
+                }
+            }
+            AISettingsPageAction::ShowImportDialog => {
+                self.import_dialog_visible = true;
+                ctx.notify();
+            }
+            AISettingsPageAction::HideImportDialog => {
+                self.import_dialog_visible = false;
+                self.import_json_text.clear();
+                self.import_pending_template = None;
+                self.import_collision = None;
+                self.import_secret_prompt = None;
+                self.import_secret_value.clear();
+                ctx.notify();
+            }
+            AISettingsPageAction::SetImportJson(json) => {
+                self.import_json_text = json.clone();
+                ctx.notify();
+            }
+            AISettingsPageAction::SetImportSecretValue(value) => {
+                self.import_secret_value = value.clone();
+                ctx.notify();
+            }
+            AISettingsPageAction::ExecuteImport => {
+                let import_json = self.import_json_text.clone();
+                let Ok(template) = ProviderExportTemplate::from_json(&import_json) else {
+                    return;
+                };
+                self.process_provider_import_template(template, None, ctx);
+            }
+            AISettingsPageAction::ResolveImportCollision {
+                provider_id,
+                action,
+            } => {
+                let Some(template) = self.import_pending_template.clone() else {
+                    return;
+                };
+                self.process_provider_import_template(
+                    template,
+                    Some((provider_id.clone(), action.clone())),
+                    ctx,
+                );
+            }
+            AISettingsPageAction::SubmitImportSecret {
+                provider_id,
+                secret_value,
+            } => {
+                let value = if secret_value.trim().is_empty() {
+                    self.import_secret_value.trim().to_string()
+                } else {
+                    secret_value.trim().to_string()
+                };
+                if value.is_empty() {
+                    return;
+                }
+                let Some(template) = self.import_pending_template.clone() else {
+                    return;
+                };
+                self.import_provider_secret(&template, provider_id, &value, ctx);
                 ctx.notify();
             }
         }
@@ -6303,304 +7484,790 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
     }
 }
 
-struct ApiKeysWidget {
-    openai_api_key_editor: ViewHandle<EditorView>,
-    anthropic_api_key_editor: ViewHandle<EditorView>,
-    google_api_key_editor: ViewHandle<EditorView>,
-
-    can_use_warp_credits_with_byok: SwitchStateHandle,
-    upgrade_highlight_index: HighlightedHyperlink,
+struct ProvidersWidget {
+    provider_kind_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    auth_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    provider_id_editor: ViewHandle<EditorView>,
+    display_name_editor: ViewHandle<EditorView>,
+    base_url_editor: ViewHandle<EditorView>,
+    model_editor: ViewHandle<EditorView>,
+    env_var_editor: ViewHandle<EditorView>,
+    secret_key_editor: ViewHandle<EditorView>,
+    // Capability dropdowns
+    cap_tools_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cap_vision_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cap_structured_outputs_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cap_prompt_caching_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cap_reasoning_controls_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cap_model_discovery_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    // Policy togges
+    policy_allow_fallback: SwitchStateHandle,
+    policy_redact_telemetry: SwitchStateHandle,
+    // Defaults
+    defaults_stream: SwitchStateHandle,
+    defaults_temperature_editor: ViewHandle<EditorView>,
+    defaults_top_p_editor: ViewHandle<EditorView>,
+    defaults_max_output_tokens_editor: ViewHandle<EditorView>,
+    defaults_timeout_ms_editor: ViewHandle<EditorView>,
+    import_json_editor: ViewHandle<EditorView>,
+    import_secret_editor: ViewHandle<EditorView>,
+    save_button: ViewHandle<ActionButton>,
+    update_button: ViewHandle<ActionButton>,
+    cancel_button: ViewHandle<ActionButton>,
+    action_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
-impl ApiKeysWidget {
-    fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
-        let ai_settings = AISettings::as_ref(ctx);
-        let workspace_handle = UserWorkspaces::handle(ctx);
-        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(ctx);
-        let is_byo_enabled = workspace_handle.as_ref(ctx).is_byo_api_key_enabled();
+impl ProvidersWidget {
+    fn new(
+        ctx: &mut ViewContext<<Self as SettingsWidget>::View>,
+        provider_id_editor: ViewHandle<EditorView>,
+        display_name_editor: ViewHandle<EditorView>,
+        base_url_editor: ViewHandle<EditorView>,
+        model_editor: ViewHandle<EditorView>,
+        env_var_editor: ViewHandle<EditorView>,
+        secret_key_editor: ViewHandle<EditorView>,
+        defaults_temperature_editor: ViewHandle<EditorView>,
+        defaults_top_p_editor: ViewHandle<EditorView>,
+        defaults_max_output_tokens_editor: ViewHandle<EditorView>,
+        defaults_timeout_ms_editor: ViewHandle<EditorView>,
+    ) -> Self {
+        let provider_kind_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(
+                vec![
+                    DropdownItem::new(
+                        "OpenAI",
+                        AISettingsPageAction::SetProviderDraftKind(ProviderKind::OpenAI),
+                    ),
+                    DropdownItem::new(
+                        "Anthropic",
+                        AISettingsPageAction::SetProviderDraftKind(ProviderKind::Anthropic),
+                    ),
+                    DropdownItem::new(
+                        "OpenAI-compatible",
+                        AISettingsPageAction::SetProviderDraftKind(ProviderKind::OpenAICompatible),
+                    ),
+                    DropdownItem::new(
+                        "Anthropic-compatible",
+                        AISettingsPageAction::SetProviderDraftKind(
+                            ProviderKind::AnthropicCompatible,
+                        ),
+                    ),
+                ],
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                AISettingsPageAction::SetProviderDraftKind(ProviderKind::OpenAICompatible),
+                ctx,
+            );
+            dropdown
+        });
 
-        let ApiKeys {
-            openai: openai_key,
-            anthropic: anthropic_key,
-            google: google_key,
-            ..
-        } = ApiKeyManager::as_ref(ctx).keys().clone();
+        let auth_mode_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(
+                vec![
+                    DropdownItem::new(
+                        ProviderDraftAuthMode::None.display_name(),
+                        AISettingsPageAction::SetProviderDraftAuthMode(ProviderDraftAuthMode::None),
+                    ),
+                    DropdownItem::new(
+                        ProviderDraftAuthMode::EnvApiKey.display_name(),
+                        AISettingsPageAction::SetProviderDraftAuthMode(
+                            ProviderDraftAuthMode::EnvApiKey,
+                        ),
+                    ),
+                    DropdownItem::new(
+                        ProviderDraftAuthMode::KeychainApiKey.display_name(),
+                        AISettingsPageAction::SetProviderDraftAuthMode(
+                            ProviderDraftAuthMode::KeychainApiKey,
+                        ),
+                    ),
+                    DropdownItem::new(
+                        ProviderDraftAuthMode::KeychainBearerToken.display_name(),
+                        AISettingsPageAction::SetProviderDraftAuthMode(
+                            ProviderDraftAuthMode::KeychainBearerToken,
+                        ),
+                    ),
+                ],
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                AISettingsPageAction::SetProviderDraftAuthMode(ProviderDraftAuthMode::None),
+                ctx,
+            );
+            dropdown
+        });
 
-        // A helper macro to create and configure an API key editor.  This avoids a lot
-        // of code duplication and ensures consistency between the editors.
-        macro_rules! create_api_key_editor {
-            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
-                let $editor = ctx.add_typed_action_view(move |ctx| {
-                    let appearance = Appearance::handle(ctx).as_ref(ctx);
-                    let options = SingleLineEditorOptions {
-                        is_password: true,
-                        text: TextOptions {
-                            font_size_override: Some(appearance.ui_font_size()),
-                            font_family_override: Some(appearance.monospace_font_family()),
-                            text_colors_override: Some(TextColors {
-                                default_color: appearance.theme().active_ui_text_color(),
-                                disabled_color: appearance.theme().disabled_ui_text_color(),
-                                hint_color: appearance.theme().disabled_ui_text_color(),
-                            }),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    let mut editor = EditorView::single_line(options, ctx);
-                    editor.set_placeholder_text($placeholder, ctx);
-                    if let Some(key) = &$key {
-                        editor.set_buffer_text(key, ctx);
-                    }
-                    editor
-                });
-                AISettingsPageView::update_editor_interaction_state(
-                    $editor.clone(),
-                    is_any_ai_enabled && is_byo_enabled,
+        let save_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Save provider", SecondaryTheme)
+                .with_icon(Icon::Plus)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::SaveProviderDraft);
+                })
+        });
+
+        let update_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Update provider", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::SaveProviderDraft);
+                })
+        });
+
+        let cancel_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Cancel", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::CancelProviderEdit);
+                })
+        });
+
+        // Capability dropdowns
+        let cap_dropdown = |ctx: &mut ViewContext<AISettingsPageView>,
+                            _label: &'static str,
+                            cap: ProviderDraftCapability| {
+            ctx.add_typed_action_view(|ctx| {
+                let mut dropdown = Dropdown::new(ctx);
+                dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+                dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+                dropdown.add_items(
+                    vec![
+                        DropdownItem::new(
+                            CapabilitySettingDraft::Auto.display_name(),
+                            AISettingsPageAction::SetProviderDraftCapability(
+                                cap.clone(),
+                                CapabilitySettingDraft::Auto,
+                            ),
+                        ),
+                        DropdownItem::new(
+                            CapabilitySettingDraft::On.display_name(),
+                            AISettingsPageAction::SetProviderDraftCapability(
+                                cap.clone(),
+                                CapabilitySettingDraft::On,
+                            ),
+                        ),
+                        DropdownItem::new(
+                            CapabilitySettingDraft::Off.display_name(),
+                            AISettingsPageAction::SetProviderDraftCapability(
+                                cap.clone(),
+                                CapabilitySettingDraft::Off,
+                            ),
+                        ),
+                    ],
                     ctx,
                 );
-                ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
-                    if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
-                        let buffer_text = $editor.as_ref(ctx).buffer_text(ctx);
-                        let key = buffer_text.is_empty().not().then_some(buffer_text);
-                        ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                            model.$set_func(key, ctx);
-                        });
-                    }
-                });
-                let editor_clone = $editor.clone();
-                ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
-                    if let UserWorkspacesEvent::TeamsChanged = event {
-                        let is_any_ai_enabled =
-                            AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
-                        let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled();
-                        let is_enabled = is_any_ai_enabled && is_byo_enabled;
-                        let has_key = !editor_clone.as_ref(ctx).is_empty(ctx);
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetProviderDraftCapability(
+                        cap.clone(),
+                        CapabilitySettingDraft::Auto,
+                    ),
+                    ctx,
+                );
+                dropdown
+            })
+        };
 
-                        // If BYO is disabled, clear the API key from the editor and storage
-                        if !is_byo_enabled && has_key {
-                            editor_clone.update(ctx, |editor, ctx| {
-                                editor.set_buffer_text("", ctx);
-                            });
-                            ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                                model.$set_func(None, ctx);
-                            });
-                        }
-
-                        AISettingsPageView::update_editor_interaction_state(
-                            editor_clone.clone(),
-                            is_enabled,
-                            ctx,
-                        );
-                        ctx.notify();
-                    }
-                })
-            };
-        }
-
-        create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
-        create_api_key_editor!(
-            anthropic_api_key_editor,
-            anthropic_key,
-            set_anthropic_key,
-            "sk-ant-..."
+        let cap_tools_dropdown = cap_dropdown(ctx, "Tools", ProviderDraftCapability::Tools);
+        let cap_vision_dropdown = cap_dropdown(ctx, "Vision", ProviderDraftCapability::Vision);
+        let cap_structured_outputs_dropdown = cap_dropdown(
+            ctx,
+            "Structured outputs",
+            ProviderDraftCapability::StructuredOutputs,
         );
-        create_api_key_editor!(
-            google_api_key_editor,
-            google_key,
-            set_google_key,
-            "AIzaSy..."
+        let cap_prompt_caching_dropdown = cap_dropdown(
+            ctx,
+            "Prompt caching",
+            ProviderDraftCapability::PromptCaching,
         );
+        let cap_reasoning_controls_dropdown = cap_dropdown(
+            ctx,
+            "Reasoning controls",
+            ProviderDraftCapability::ReasoningControls,
+        );
+        let cap_model_discovery_dropdown = cap_dropdown(
+            ctx,
+            "Model discovery",
+            ProviderDraftCapability::ModelDiscovery,
+        );
+
+        // Policy toggles
+        let policy_allow_fallback = SwitchStateHandle::default();
+        let policy_redact_telemetry = SwitchStateHandle::default();
+
+        // Defaults
+        let defaults_stream = SwitchStateHandle::default();
+        let import_json_editor = Self::new_import_editor(ctx);
+        let import_secret_editor = Self::new_import_secret_editor(ctx);
 
         Self {
-            openai_api_key_editor,
-            anthropic_api_key_editor,
-            google_api_key_editor,
-
-            can_use_warp_credits_with_byok: Default::default(),
-            upgrade_highlight_index: Default::default(),
+            provider_kind_dropdown,
+            auth_mode_dropdown,
+            provider_id_editor,
+            display_name_editor,
+            base_url_editor,
+            model_editor,
+            env_var_editor,
+            secret_key_editor,
+            cap_tools_dropdown,
+            cap_vision_dropdown,
+            cap_structured_outputs_dropdown,
+            cap_prompt_caching_dropdown,
+            cap_reasoning_controls_dropdown,
+            cap_model_discovery_dropdown,
+            policy_allow_fallback,
+            policy_redact_telemetry,
+            defaults_stream,
+            defaults_temperature_editor,
+            defaults_top_p_editor,
+            defaults_max_output_tokens_editor,
+            defaults_timeout_ms_editor,
+            import_json_editor,
+            import_secret_editor,
+            save_button,
+            update_button,
+            cancel_button,
+            action_mouse_states: RefCell::new(HashMap::new()),
         }
     }
 
-    fn render_api_keys_section(
-        &self,
-        appearance: &Appearance,
-        app: &AppContext,
-        is_byo_enabled: bool,
-    ) -> Box<dyn Element> {
-        let ai_settings = AISettings::as_ref(app);
-        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(app);
-        let is_enabled = is_any_ai_enabled && is_byo_enabled;
-
-        let mut column = Flex::column()
-            .with_spacing(16.)
-            .with_child(
-                Container::new(
-                    render_ai_setting_description(
-                        "Use your own API keys from model providers for the Warp Agent to use. API keys are stored locally and never synced to the cloud. Using auto models or models from providers you have not provided API keys for will consume Warp credits.",
-                        is_enabled,
-                        app,
-                    ))
-                // Remove the bottom margin of the description so that it doesn't
-                // create extra space between the description and the API key inputs.
-                .with_margin_bottom(-styles::DESCRIPTION_MARGIN_BOTTOM).finish()
-            );
-
-        /// Helper function to render the UI for an API key input field.
-        fn render_api_key_input(
-            appearance: &Appearance,
-            label: &'static str,
-            editor: ViewHandle<EditorView>,
-            is_enabled: bool,
-            app: &AppContext,
-        ) -> Box<dyn Element> {
-            let padding = Some(Coords {
-                top: 10.,
-                bottom: 10.,
-                left: 16.,
-                right: 16.,
-            });
-            let editor_style = UiComponentStyles {
-                padding,
-                background: Some(appearance.theme().surface_2().into()),
+    fn new_import_editor(ctx: &mut ViewContext<AISettingsPageView>) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = EditorOptions {
+                autogrow: true,
+                soft_wrap: true,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
-
-            let label = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
-                .with_color(styles::header_font_color(is_enabled, app).into())
-                .finish();
-
-            let input = appearance
-                .ui_builder()
-                .text_input(editor)
-                .with_style(editor_style)
-                .build()
-                .finish();
-
-            Flex::column()
-                .with_spacing(8.)
-                .with_child(label)
-                .with_child(input)
-                .finish()
-        }
-
-        column.add_child(render_api_key_input(
-            appearance,
-            "OpenAI API Key",
-            self.openai_api_key_editor.clone(),
-            is_enabled,
-            app,
-        ));
-        column.add_child(render_api_key_input(
-            appearance,
-            "Anthropic API Key",
-            self.anthropic_api_key_editor.clone(),
-            is_enabled,
-            app,
-        ));
-        column.add_child(render_api_key_input(
-            appearance,
-            "Google API Key",
-            self.google_api_key_editor.clone(),
-            is_enabled,
-            app,
-        ));
-
-        // Show upgrade CTA if BYOK is not enabled
-        if !is_byo_enabled {
-            let auth_state = AuthStateProvider::as_ref(app).get();
-            let upgrade_text_fragments = if let Some(team) =
-                UserWorkspaces::as_ref(app).current_team()
-            {
-                // Enterprise teams don't have a self-serve upgrade path; route them
-                // to sales to enable BYOK on their existing plan.
-                if team.billing_metadata.customer_type == CustomerType::Enterprise {
-                    vec![
-                        FormattedTextFragment::hyperlink("Contact sales", "mailto:sales@warp.dev"),
-                        FormattedTextFragment::plain_text(
-                            " to enable bringing your own API keys on your Enterprise plan.",
-                        ),
-                    ]
-                } else {
-                    let current_user_email = auth_state.user_email().unwrap_or_default();
-                    let has_admin_permissions = team.has_admin_permissions(&current_user_email);
-                    let upgrade_url = UserWorkspaces::upgrade_link_for_team(team.uid);
-                    if has_admin_permissions {
-                        vec![
-                            FormattedTextFragment::hyperlink(
-                                "Upgrade to the Build plan",
-                                upgrade_url,
-                            ),
-                            FormattedTextFragment::plain_text(" to use your own API keys."),
-                        ]
-                    } else {
-                        vec![FormattedTextFragment::plain_text(
-                            "Ask your team's admin to upgrade to the Build plan to use your own API keys.",
-                        )]
-                    }
-                }
-            } else {
-                let user_id = auth_state.user_id().unwrap_or_default();
-                let upgrade_url = UserWorkspaces::upgrade_link(user_id);
-                vec![
-                    FormattedTextFragment::hyperlink("Upgrade to the Build plan", upgrade_url),
-                    FormattedTextFragment::plain_text(" to use your own API keys."),
-                ]
-            };
-
-            let upgrade_text_element = FormattedTextElement::new(
-                FormattedText::new([FormattedTextLine::Line(upgrade_text_fragments)]),
-                appearance.ui_font_size(),
-                appearance.ui_font_family(),
-                appearance.ui_font_family(),
-                blended_colors::text_sub(appearance.theme(), appearance.theme().surface_1()),
-                self.upgrade_highlight_index.clone(),
-            )
-            .with_hyperlink_font_color(appearance.theme().accent().into_solid())
-            .register_default_click_handlers(|url, ctx, _| {
-                ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
-            });
-
-            column.add_child(Container::new(upgrade_text_element.finish()).finish());
-        }
-
-        column.finish()
+            let mut editor = EditorView::new(options, ctx);
+            editor.set_placeholder_text("Paste a redacted provider JSON export", ctx);
+            editor
+        });
+        ctx.subscribe_to_view(&editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Edited(_) | EditorEvent::Blurred) {
+                ctx.dispatch_typed_action(&AISettingsPageAction::SetImportJson(
+                    editor.as_ref(ctx).buffer_text(ctx),
+                ));
+            }
+        });
+        editor
     }
 
-    fn render_can_use_warp_credits_with_byok_toggle(
-        &self,
-        view: &AISettingsPageView,
+    fn new_import_secret_editor(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password: true,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("Secret value", ctx);
+            editor
+        });
+        ctx.subscribe_to_view(&editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Edited(_) | EditorEvent::Blurred) {
+                ctx.dispatch_typed_action(&AISettingsPageAction::SetImportSecretValue(
+                    editor.as_ref(ctx).buffer_text(ctx),
+                ));
+            }
+        });
+        editor
+    }
+
+    fn render_input(
+        label: &'static str,
+        editor: ViewHandle<EditorView>,
+        appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let ai_settings = AISettings::as_ref(app);
-
-        let toggle = render_ai_setting_toggle::<CanUseWarpCreditsWithByok>(
-            "Warp credit fallback",
-            AISettingsPageAction::ToggleCanUseWarpCreditsWithByok,
-            *ai_settings.can_use_warp_credits_with_byok,
-            ai_settings.is_any_ai_enabled(app),
-            self.can_use_warp_credits_with_byok.clone(),
-            &view.local_only_icon_tooltip_states,
-            app,
-        );
-
-        let description = render_ai_setting_description(
-            "When enabled, agent requests may be routed to one of Warp's provided models in the event of an error. Warp will prioritize using your API keys over your Warp credits.",
-            ai_settings.is_any_ai_enabled(app),
-            app,
-        );
-
+        let label = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+            .with_color(styles::header_font_color(true, app).into())
+            .finish();
+        let input = appearance
+            .ui_builder()
+            .text_input(editor)
+            .with_style(UiComponentStyles {
+                padding: Some(Coords {
+                    top: 10.,
+                    bottom: 10.,
+                    left: 12.,
+                    right: 12.,
+                }),
+                background: Some(appearance.theme().surface_2().into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
         Flex::column()
-            .with_child(toggle)
-            .with_child(description)
+            .with_spacing(6.)
+            .with_child(label)
+            .with_child(input)
             .finish()
+    }
+
+    fn render_text_button(
+        &self,
+        key: String,
+        label: &'static str,
+        action: AISettingsPageAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let mouse_state = self
+            .action_mouse_states
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .clone();
+        appearance
+            .ui_builder()
+            .button(ButtonVariant::Text, mouse_state)
+            .with_text_label(label.to_string())
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+            })
+            .finish()
+    }
+
+    fn render_capability_dropdown(
+        label: &'static str,
+        dropdown: &ViewHandle<Dropdown<AISettingsPageAction>>,
+        _current: CapabilitySettingDraft,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let label_el = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+            .with_color(styles::header_font_color(true, app).into())
+            .finish();
+        let dropdown_el = Container::new(ChildView::new(dropdown).finish())
+            .with_margin_top(4.)
+            .finish();
+        Flex::column()
+            .with_spacing(4.)
+            .with_child(label_el)
+            .with_child(dropdown_el)
+            .finish()
+    }
+
+    fn render_policy_toggle(
+        label: &'static str,
+        is_enabled: bool,
+        action: AISettingsPageAction,
+        state: SwitchStateHandle,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::header_font_color(true, app).into())
+                    .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .switch(state)
+                    .check(is_enabled)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(action.clone());
+                    })
+                    .finish(),
+            )
+            .finish()
+    }
+
+    fn render_defaults_toggle(
+        label: &'static str,
+        is_enabled: bool,
+        state: SwitchStateHandle,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::row()
+            .with_spacing(8.)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::header_font_color(true, app).into())
+                    .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .switch(state)
+                    .check(is_enabled)
+                    .build()
+                    .finish(),
+            )
+            .finish()
+    }
+
+    fn render_provider_row(
+        &self,
+        provider: &::ai::provider_registry::ProviderProfile,
+        registry: &ProviderRegistry,
+        validation_state: Option<&ProviderValidationUiState>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_default = registry.defaults.agent_provider.as_deref() == Some(provider.id.as_str());
+        let status = if provider.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        };
+        let local = if provider.policy.local_only == Some(true) {
+            " local"
+        } else {
+            ""
+        };
+        let model_ids = provider.model_ids();
+        let default_model = provider
+            .defaults
+            .model
+            .clone()
+            .or_else(|| model_ids.first().cloned())
+            .unwrap_or_else(|| "auto".to_string());
+        let model_summary = if model_ids.is_empty() {
+            "No models configured".to_string()
+        } else {
+            format!("Models: {}", model_ids.join(", "))
+        };
+        let kind = provider_kind_label(&provider.kind);
+        let connection_hint = if provider.kind.is_direct() {
+            if provider.policy.local_only == Some(true) {
+                format!("Direct API ({kind}, local) — sends requests directly to {kind}")
+            } else {
+                format!("Direct API — sends requests directly to {kind}")
+            }
+        } else {
+            "Warp-hosted — requests routed through Warp".to_string()
+        };
+        let title = format!("{} ({})", provider.display_name, provider.id);
+        let detail = format!("{connection_hint} - {status}{local} - {model_summary}");
+
+        let mut actions = Flex::row()
+            .with_spacing(8.)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center);
+        if provider.id != WARP_HOSTED_PROVIDER_ID {
+            actions.add_child(self.render_text_button(
+                format!("{}:edit", provider.id),
+                "Edit",
+                AISettingsPageAction::EditProvider(provider.id.clone()),
+                appearance,
+            ));
+            actions.add_child(self.render_text_button(
+                format!("{}:validate", provider.id),
+                "Validate",
+                AISettingsPageAction::ValidateProvider(provider.id.clone()),
+                appearance,
+            ));
+            actions.add_child(self.render_text_button(
+                format!("{}:discover", provider.id),
+                "Discover models",
+                AISettingsPageAction::DiscoverProviderModels(provider.id.clone()),
+                appearance,
+            ));
+            actions.add_child(self.render_text_button(
+                format!("{}:toggle", provider.id),
+                if provider.enabled {
+                    "Disable"
+                } else {
+                    "Enable"
+                },
+                AISettingsPageAction::ToggleProviderEnabled(provider.id.clone()),
+                appearance,
+            ));
+            actions.add_child(self.render_text_button(
+                format!("{}:duplicate", provider.id),
+                "Duplicate",
+                AISettingsPageAction::DuplicateProvider(provider.id.clone()),
+                appearance,
+            ));
+            actions.add_child(self.render_text_button(
+                format!("{}:export", provider.id),
+                "Export",
+                AISettingsPageAction::ExportProvider(provider.id.clone()),
+                appearance,
+            ));
+            if !is_legacy_provider_id(&provider.id) {
+                actions.add_child(self.render_text_button(
+                    format!("{}:delete", provider.id),
+                    "Delete",
+                    AISettingsPageAction::DeleteProvider(provider.id.clone()),
+                    appearance,
+                ));
+            }
+        }
+        if !is_default && provider.enabled {
+            actions.add_child(self.render_text_button(
+                format!("{}:default", provider.id),
+                "Set default",
+                AISettingsPageAction::SetDefaultProvider {
+                    provider_id: provider.id.clone(),
+                    model_id: default_model,
+                },
+                appearance,
+            ));
+        }
+
+        let default_label = if is_default {
+            Some(
+                Text::new_inline("Default", appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(appearance.theme().accent().into())
+                    .finish(),
+            )
+        } else {
+            None
+        };
+
+        let mut header = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(8.)
+            .with_child(
+                Expanded::new(
+                    1.,
+                    Text::new_inline(title, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(styles::header_font_color(provider.enabled, app).into())
+                        .finish(),
+                )
+                .finish(),
+            );
+        if let Some(default_label) = default_label {
+            header.add_child(default_label);
+        }
+
+        let mut content = Flex::column()
+            .with_spacing(8.)
+            .with_child(header.finish())
+            .with_child(
+                Text::new(detail, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::description_font_color(provider.enabled, app).into())
+                    .soft_wrap(true)
+                    .finish(),
+            );
+        if let Some(validation_state) = validation_state {
+            content.add_child(render_provider_validation_state(
+                validation_state,
+                provider.kind.is_compatible(),
+                appearance,
+                app,
+            ));
+        }
+        content.add_child(actions.finish());
+
+        Container::new(content.finish())
+            .with_uniform_padding(12.)
+            .with_background(appearance.theme().surface_2())
+            .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+            .finish()
+    }
+
+    fn render_import_panel(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        if !view.import_dialog_visible {
+            return None;
+        }
+
+        let mut panel = Flex::column().with_spacing(10.);
+        panel.add_child(
+            Text::new_inline(
+                "Import providers",
+                appearance.ui_font_family(),
+                CONTENT_FONT_SIZE,
+            )
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(appearance.theme().active_ui_text_color().into())
+            .finish(),
+        );
+        panel.add_child(
+            Text::new(
+                "Paste a redacted provider export. Keychain secrets are not imported until you enter a replacement secret value.",
+                appearance.ui_font_family(),
+                CONTENT_FONT_SIZE,
+            )
+            .with_color(styles::description_font_color(true, app).into())
+            .soft_wrap(true)
+            .finish(),
+        );
+
+        if let Some((provider_id, _)) = &view.import_collision {
+            panel.add_child(self.render_import_notice(
+                format!("Provider ID '{provider_id}' already exists."),
+                "Choose how to handle this imported provider.".to_string(),
+                appearance,
+                app,
+            ));
+            panel.add_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_child(self.render_text_button(
+                        format!("import:{provider_id}:overwrite"),
+                        "Overwrite",
+                        AISettingsPageAction::ResolveImportCollision {
+                            provider_id: provider_id.clone(),
+                            action: ImportCollisionAction::Overwrite,
+                        },
+                        appearance,
+                    ))
+                    .with_child(self.render_text_button(
+                        format!("import:{provider_id}:rename"),
+                        "Rename",
+                        AISettingsPageAction::ResolveImportCollision {
+                            provider_id: provider_id.clone(),
+                            action: ImportCollisionAction::Rename,
+                        },
+                        appearance,
+                    ))
+                    .with_child(self.render_text_button(
+                        format!("import:{provider_id}:skip"),
+                        "Skip",
+                        AISettingsPageAction::ResolveImportCollision {
+                            provider_id: provider_id.clone(),
+                            action: ImportCollisionAction::Skip,
+                        },
+                        appearance,
+                    ))
+                    .finish(),
+            );
+        } else if let Some(secret_prompt) = &view.import_secret_prompt {
+            panel.add_child(self.render_import_notice(
+                format!("Secret required for '{}'.", secret_prompt.provider_id),
+                secret_prompt.secret_hint.clone(),
+                appearance,
+                app,
+            ));
+            panel.add_child(Self::render_input(
+                "Secret value",
+                self.import_secret_editor.clone(),
+                appearance,
+                app,
+            ));
+            panel.add_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_child(self.render_text_button(
+                        format!("import:{}:submit-secret", secret_prompt.provider_id),
+                        "Store secret and import",
+                        AISettingsPageAction::SubmitImportSecret {
+                            provider_id: secret_prompt.provider_id.clone(),
+                            secret_value: view.import_secret_value.clone(),
+                        },
+                        appearance,
+                    ))
+                    .finish(),
+            );
+        } else {
+            panel.add_child(Self::render_input(
+                "Provider export JSON",
+                self.import_json_editor.clone(),
+                appearance,
+                app,
+            ));
+            panel.add_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_child(self.render_text_button(
+                        "import:execute".to_string(),
+                        "Import",
+                        AISettingsPageAction::ExecuteImport,
+                        appearance,
+                    ))
+                    .with_child(self.render_text_button(
+                        "import:cancel".to_string(),
+                        "Cancel",
+                        AISettingsPageAction::HideImportDialog,
+                        appearance,
+                    ))
+                    .finish(),
+            );
+        }
+
+        Some(
+            Container::new(panel.finish())
+                .with_uniform_padding(12.)
+                .with_background(appearance.theme().surface_1())
+                .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish(),
+        )
+    }
+
+    fn render_import_notice(
+        &self,
+        title: String,
+        detail: String,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Container::new(
+            Flex::column()
+                .with_spacing(4.)
+                .with_child(
+                    Text::new_inline(title, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(appearance.theme().active_ui_text_color().into())
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(detail, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_color(styles::description_font_color(true, app).into())
+                        .soft_wrap(true)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(10.)
+        .with_background(appearance.theme().surface_2())
+        .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .finish()
     }
 }
 
-impl SettingsWidget for ApiKeysWidget {
+impl SettingsWidget for ProvidersWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "providers byo api key local models openai anthropic ollama lm studio compatible endpoint env var"
     }
 
     fn render(
@@ -6609,35 +8276,773 @@ impl SettingsWidget for ApiKeysWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let ai_settings = AISettings::as_ref(app);
-        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(app);
-        let is_byo_enabled = UserWorkspaces::as_ref(app).is_byo_api_key_enabled();
-
-        let mut column = Flex::column()
-            .with_child(render_separator(appearance))
-            .with_child(
-                build_sub_header(
-                    appearance,
-                    "API Keys",
-                    Some(styles::header_font_color(is_any_ai_enabled, app)),
-                )
-                .with_padding_bottom(HEADER_PADDING)
-                .finish(),
+        let registry = ApiKeyManager::as_ref(app).provider_registry_from_legacy_keys(Some(
+            AISettings::as_ref(app).provider_registry.value().clone(),
+        ));
+        let mut providers = registry.providers.values().collect_vec();
+        providers.sort_by_key(|provider| {
+            (
+                provider.id == WARP_HOSTED_PROVIDER_ID,
+                provider.display_name.clone(),
             )
-            .with_child(self.render_api_keys_section(appearance, app, is_byo_enabled));
+        });
 
-        if is_byo_enabled {
-            column.add_child(
-                Container::new(self.render_can_use_warp_credits_with_byok_toggle(view, app))
-                    .with_margin_top(16.)
+        let mut list = Flex::column().with_spacing(8.);
+        for provider in providers {
+            list.add_child(self.render_provider_row(
+                provider,
+                &registry,
+                view.provider_validation_states.get(&provider.id),
+                appearance,
+                app,
+            ));
+        }
+        let provider_actions = Flex::row()
+            .with_spacing(8.)
+            .with_child(self.render_text_button(
+                "providers:add".to_string(),
+                "Add provider",
+                AISettingsPageAction::AddProvider,
+                appearance,
+            ))
+            .with_child(self.render_text_button(
+                "providers:import".to_string(),
+                "Import providers",
+                AISettingsPageAction::ShowImportDialog,
+                appearance,
+            ))
+            .with_child(self.render_text_button(
+                "providers:export-all".to_string(),
+                "Export all",
+                AISettingsPageAction::ExportAllProviders,
+                appearance,
+            ))
+            .finish();
+
+        // Update save button label based on editing mode
+        let is_editing = view.provider_draft.is_editing();
+
+        // Build form children
+        let mut form = Flex::column().with_spacing(12.);
+
+        // Provider kind + auth mode dropdowns
+        form.add_child(
+            Flex::row()
+                .with_spacing(12.)
+                .with_child(
+                    Expanded::new(1., ChildView::new(&self.provider_kind_dropdown).finish())
+                        .finish(),
+                )
+                .with_child(
+                    Expanded::new(1., ChildView::new(&self.auth_mode_dropdown).finish()).finish(),
+                )
+                .finish(),
+        );
+
+        // Provider ID (only shown when creating, not editing)
+        if !is_editing {
+            form.add_child(
+                Flex::row()
+                    .with_spacing(12.)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Self::render_input(
+                                "Provider ID",
+                                self.provider_id_editor.clone(),
+                                appearance,
+                                app,
+                            ),
+                        )
+                        .finish(),
+                    )
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Self::render_input(
+                                "Display name",
+                                self.display_name_editor.clone(),
+                                appearance,
+                                app,
+                            ),
+                        )
+                        .finish(),
+                    )
+                    .finish(),
+            );
+        } else {
+            form.add_child(
+                Flex::row()
+                    .with_spacing(12.)
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Self::render_input(
+                                "Display name",
+                                self.display_name_editor.clone(),
+                                appearance,
+                                app,
+                            ),
+                        )
+                        .finish(),
+                    )
+                    // Show read-only ID label when editing
+                    .with_child(
+                        Expanded::new(
+                            1.,
+                            Flex::column()
+                                .with_spacing(6.)
+                                .with_child(
+                                    Text::new_inline(
+                                        "Provider ID",
+                                        appearance.ui_font_family(),
+                                        CONTENT_FONT_SIZE,
+                                    )
+                                    .with_color(styles::header_font_color(true, app).into())
+                                    .finish(),
+                                )
+                                .with_child(
+                                    Text::new_inline(
+                                        view.provider_draft.id.clone(),
+                                        appearance.ui_font_family(),
+                                        CONTENT_FONT_SIZE,
+                                    )
+                                    .with_color(appearance.theme().disabled_ui_text_color().into())
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .finish(),
+                    )
                     .finish(),
             );
         }
 
-        Container::new(column.finish())
-            .with_margin_bottom(HEADER_PADDING)
+        form.add_child(Self::render_input(
+            "Base URL",
+            self.base_url_editor.clone(),
+            appearance,
+            app,
+        ));
+        form.add_child(
+            Flex::row()
+                .with_spacing(12.)
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        Self::render_input(
+                            "Manual model ID",
+                            self.model_editor.clone(),
+                            appearance,
+                            app,
+                        ),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        match view.provider_draft.auth_mode {
+                            ProviderDraftAuthMode::KeychainApiKey
+                            | ProviderDraftAuthMode::KeychainBearerToken => Self::render_input(
+                                if is_editing {
+                                    "Replace secret key"
+                                } else {
+                                    "Secret key"
+                                },
+                                self.secret_key_editor.clone(),
+                                appearance,
+                                app,
+                            ),
+                            ProviderDraftAuthMode::EnvApiKey => Self::render_input(
+                                "API key env var",
+                                self.env_var_editor.clone(),
+                                appearance,
+                                app,
+                            ),
+                            ProviderDraftAuthMode::None => Flex::column().finish(),
+                        },
+                    )
+                    .finish(),
+                )
+                .finish(),
+        );
+
+        // Capabilities section
+        form.add_child(
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(
+                    Text::new_inline(
+                        "Capabilities",
+                        appearance.ui_font_family(),
+                        CONTENT_FONT_SIZE,
+                    )
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_color(appearance.theme().active_ui_text_color().into())
+                    .finish(),
+                )
+                .with_child(
+                    Flex::row()
+                        .with_spacing(12.)
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Tools",
+                                    &self.cap_tools_dropdown,
+                                    view.provider_draft.cap_tools.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Vision",
+                                    &self.cap_vision_dropdown,
+                                    view.provider_draft.cap_vision.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Structured outputs",
+                                    &self.cap_structured_outputs_dropdown,
+                                    view.provider_draft.cap_structured_outputs.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_child(
+                    Flex::row()
+                        .with_spacing(12.)
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Prompt caching",
+                                    &self.cap_prompt_caching_dropdown,
+                                    view.provider_draft.cap_prompt_caching.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Reasoning controls",
+                                    &self.cap_reasoning_controls_dropdown,
+                                    view.provider_draft.cap_reasoning_controls.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_capability_dropdown(
+                                    "Model discovery",
+                                    &self.cap_model_discovery_dropdown,
+                                    view.provider_draft.cap_model_discovery.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .finish(),
+        );
+
+        // Policy section
+        form.add_child(
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(
+                    Text::new_inline("Policy", appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(appearance.theme().active_ui_text_color().into())
+                        .finish(),
+                )
+                .with_child(Self::render_policy_toggle(
+                    "Fallback to Warp hosted",
+                    view.provider_draft.allow_fallback,
+                    AISettingsPageAction::SetProviderDraftPolicy(
+                        ProviderDraftPolicy::AllowFallback,
+                        true,
+                    ),
+                    self.policy_allow_fallback.clone(),
+                    appearance,
+                    app,
+                ))
+                .with_child(Self::render_policy_toggle(
+                    "Redact telemetry",
+                    view.provider_draft.redact_telemetry,
+                    AISettingsPageAction::SetProviderDraftPolicy(
+                        ProviderDraftPolicy::RedactTelemetry,
+                        true,
+                    ),
+                    self.policy_redact_telemetry.clone(),
+                    appearance,
+                    app,
+                ))
+                .finish(),
+        );
+
+        // Defaults section
+        form.add_child(
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(
+                    Text::new_inline("Defaults", appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(appearance.theme().active_ui_text_color().into())
+                        .finish(),
+                )
+                .with_child(
+                    Flex::row()
+                        .with_spacing(12.)
+                        .with_child(Self::render_defaults_toggle(
+                            "Stream",
+                            view.provider_draft.stream,
+                            self.defaults_stream.clone(),
+                            appearance,
+                            app,
+                        ))
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_input(
+                                    "Temperature",
+                                    self.defaults_temperature_editor.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_input(
+                                    "Top P",
+                                    self.defaults_top_p_editor.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_child(
+                    Flex::row()
+                        .with_spacing(12.)
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_input(
+                                    "Max output tokens",
+                                    self.defaults_max_output_tokens_editor.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                Self::render_input(
+                                    "Timeout (ms)",
+                                    self.defaults_timeout_ms_editor.clone(),
+                                    appearance,
+                                    app,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .finish(),
+        );
+
+        // Action buttons: Cancel (editing only) + Save/Update
+        if is_editing {
+            form.add_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_child(ChildView::new(&self.cancel_button).finish())
+                    .with_child(ChildView::new(&self.update_button).finish())
+                    .finish(),
+            );
+        } else {
+            form.add_child(ChildView::new(&self.save_button).finish());
+        }
+        let form = form.finish();
+
+        let mut providers_section = Flex::column()
+            .with_child(render_separator(appearance))
+            .with_child(
+                build_sub_header(appearance, "Providers", None)
+                    .with_margin_bottom(8.)
+                    .finish(),
+            )
+            .with_child(render_ai_setting_description(
+                "API providers connect directly to external AI services via HTTP. They are different from CLI agents, which run as separate processes on your machine. Secrets are stored in your OS keychain; this form supports no-auth local endpoints, API keys from environment variables, and API keys or bearer tokens from secure storage.",
+                true,
+                app,
+            ))
+            .with_child(Container::new(provider_actions).with_margin_bottom(8.).finish());
+        if let Some(import_panel) = self.render_import_panel(view, appearance, app) {
+            providers_section
+                .add_child(Container::new(import_panel).with_margin_bottom(8.).finish());
+        }
+        providers_section
+            .with_child(list.finish())
+            .with_child(
+                Container::new(form)
+                    .with_margin_top(8.)
+                    .with_uniform_padding(12.)
+                    .with_background(appearance.theme().surface_1())
+                    .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish(),
+            )
             .finish()
     }
+}
+
+fn render_provider_validation_state(
+    state: &ProviderValidationUiState,
+    is_compatible_provider: bool,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let color = if state.is_success() {
+        appearance.theme().accent()
+    } else {
+        styles::description_font_color(true, app)
+    };
+    let mut detail = state.detail();
+    if matches!(state, ProviderValidationUiState::DiscoveryFailed(_)) && is_compatible_provider {
+        detail.push_str(" You can keep using a compatible endpoint with manual model IDs.");
+    }
+
+    Container::new(
+        Flex::column()
+            .with_spacing(4.)
+            .with_child(
+                Text::new_inline(
+                    state.title(),
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(color.into())
+                .finish(),
+            )
+            .with_child(
+                Text::new(detail, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::description_font_color(true, app).into())
+                    .soft_wrap(true)
+                    .finish(),
+            )
+            .finish(),
+    )
+    .with_uniform_padding(10.)
+    .with_background(appearance.theme().surface_1())
+    .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+    .finish()
+}
+
+fn provider_kind_label(kind: &ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::WarpHosted => "Warp-hosted",
+        ProviderKind::OpenAI => "OpenAI",
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::OpenAICompatible => "OpenAI-compatible",
+        ProviderKind::AnthropicCompatible => "Anthropic-compatible",
+    }
+}
+
+fn default_base_url_for_kind(kind: &ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::WarpHosted => "",
+        ProviderKind::OpenAI => "https://api.openai.com/v1",
+        ProviderKind::Anthropic => "https://api.anthropic.com/v1",
+        ProviderKind::OpenAICompatible | ProviderKind::AnthropicCompatible => "",
+    }
+}
+
+fn provider_id_from_text(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn unique_provider_id(
+    providers: &BTreeMap<String, ::ai::provider_registry::ProviderProfile>,
+    base: &str,
+) -> String {
+    let base = provider_id_from_text(base);
+    let base = if base.is_empty() {
+        "provider".to_string()
+    } else {
+        base
+    };
+    if !providers.contains_key(&base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base}-{index}");
+        if !providers.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded provider id suffix search should always return")
+}
+
+fn is_legacy_provider_id(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        LEGACY_OPENAI_PROVIDER_ID | LEGACY_ANTHROPIC_PROVIDER_ID
+    )
+}
+
+fn provider_registry_with_draft(
+    draft: &ProviderDraft,
+    api_keys: &ApiKeys,
+    provider_registry: &ProviderRegistry,
+    ctx: &mut ViewContext<AISettingsPageView>,
+) -> Option<ProviderRegistry> {
+    let id = provider_id_from_text(&draft.id);
+    if id.is_empty() {
+        return None;
+    }
+    let display_name = if draft.display_name.is_empty() {
+        id.clone()
+    } else {
+        draft.display_name.clone()
+    };
+    let base_url = if draft.base_url.is_empty() {
+        default_base_url_for_kind(&draft.kind).to_string()
+    } else {
+        draft.base_url.clone()
+    };
+
+    // When editing, preserve the existing secret reference if the user didn't re-enter it.
+    let existing_secret_ref = draft.editing_provider_id.as_ref().and_then(|edit_id| {
+        provider_registry
+            .providers
+            .get(edit_id)
+            .and_then(|p| match &p.auth {
+                AuthConfig::ApiKey {
+                    source: AuthSource::Keychain,
+                    secret_ref: Some(ref_),
+                    ..
+                }
+                | AuthConfig::BearerToken {
+                    source: AuthSource::Keychain,
+                    secret_ref: ref_,
+                } => Some(ref_.clone()),
+                _ => None,
+            })
+    });
+
+    let auth = match draft.auth_mode {
+        ProviderDraftAuthMode::None => AuthConfig::None,
+        ProviderDraftAuthMode::EnvApiKey => {
+            let env_var = draft.env_var.trim();
+            if env_var.is_empty() {
+                return None;
+            }
+            AuthConfig::ApiKey {
+                source: AuthSource::Env,
+                secret_ref: None,
+                env_var: Some(env_var.to_string()),
+            }
+        }
+        ProviderDraftAuthMode::KeychainApiKey => {
+            if draft.secret_key.trim().is_empty() {
+                // When editing, keep the existing secret reference.
+                if let Some(ref_) = &existing_secret_ref {
+                    AuthConfig::ApiKey {
+                        source: AuthSource::Keychain,
+                        secret_ref: Some(ref_.clone()),
+                        env_var: None,
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                let secret_ref = format!("keychain://warp/providers/{id}");
+                if let Err(e) = ctx
+                    .secure_storage()
+                    .write_value(&secret_ref, draft.secret_key.trim())
+                {
+                    log::error!("Failed to write provider API key to secure storage: {e:#}");
+                    return None;
+                }
+                AuthConfig::ApiKey {
+                    source: AuthSource::Keychain,
+                    secret_ref: Some(secret_ref),
+                    env_var: None,
+                }
+            }
+        }
+        ProviderDraftAuthMode::KeychainBearerToken => {
+            if draft.secret_key.trim().is_empty() {
+                // When editing, keep the existing secret reference.
+                if let Some(ref_) = &existing_secret_ref {
+                    AuthConfig::BearerToken {
+                        source: AuthSource::Keychain,
+                        secret_ref: ref_.clone(),
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                let secret_ref = format!("keychain://warp/providers/{id}");
+                if let Err(e) = ctx
+                    .secure_storage()
+                    .write_value(&secret_ref, draft.secret_key.trim())
+                {
+                    log::error!("Failed to write bearer token to secure storage: {e:#}");
+                    return None;
+                }
+                AuthConfig::BearerToken {
+                    source: AuthSource::Keychain,
+                    secret_ref,
+                }
+            }
+        }
+    };
+
+    let mut registry = ProviderRegistry::from_existing(Some(provider_registry.clone()), api_keys);
+    let mut profile = ::ai::provider_registry::ProviderProfile::direct(
+        id.clone(),
+        draft.kind.clone(),
+        display_name,
+        Some(base_url),
+        auth,
+    );
+    profile.capabilities = draft.capabilities();
+    profile.policy = draft.policy();
+    profile.defaults = draft.defaults();
+    if !draft.model.trim().is_empty() {
+        profile.discovery = ProviderDiscovery {
+            strategy: DiscoveryStrategy::ManualOnly,
+            fallback_models: vec![draft.model.trim().to_string()],
+        };
+    }
+    registry.upsert_provider(profile);
+    Some(registry)
+}
+
+fn provider_profile_for_action(provider_id: &str, ctx: &AppContext) -> Option<ProviderProfile> {
+    ApiKeyManager::as_ref(ctx)
+        .provider_registry_from_legacy_keys(Some(
+            AISettings::as_ref(ctx).provider_registry.value().clone(),
+        ))
+        .providers
+        .get(provider_id)
+        .cloned()
+}
+
+fn provider_secret_values(
+    profile: &ProviderProfile,
+    legacy_keys: &ApiKeys,
+    ctx: &AppContext,
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    if let Some(openai) = &legacy_keys.openai {
+        values.insert("legacy://AiApiKeys/openai".to_string(), openai.clone());
+    }
+    if let Some(anthropic) = &legacy_keys.anthropic {
+        values.insert(
+            "legacy://AiApiKeys/anthropic".to_string(),
+            anthropic.clone(),
+        );
+    }
+
+    match &profile.auth {
+        AuthConfig::ApiKey {
+            source: AuthSource::Keychain,
+            secret_ref: Some(secret_ref),
+            ..
+        }
+        | AuthConfig::BearerToken { secret_ref, .. } => {
+            if !secret_ref.starts_with("legacy://") {
+                if let Ok(value) = ctx.secure_storage().read_value(secret_ref) {
+                    values.insert(secret_ref.clone(), value);
+                }
+            }
+        }
+        AuthConfig::None
+        | AuthConfig::ApiKey {
+            source: AuthSource::Env,
+            ..
+        }
+        | AuthConfig::ApiKey {
+            source: AuthSource::Keychain,
+            secret_ref: None,
+            ..
+        } => {}
+    }
+
+    values
+}
+
+fn provider_secret_value(ref_: &str, values: &HashMap<String, String>) -> Option<String> {
+    values
+        .get(ref_)
+        .cloned()
+        .or_else(|| std::env::var(ref_).ok())
+}
+
+fn update_provider_registry(
+    ctx: &mut ViewContext<AISettingsPageView>,
+    update: impl FnOnce(&mut ProviderRegistry),
+) {
+    let mut registry = ApiKeyManager::as_ref(ctx).provider_registry_from_legacy_keys(Some(
+        AISettings::as_ref(ctx).provider_registry.value().clone(),
+    ));
+    update(&mut registry);
+    AISettings::handle(ctx).update(ctx, |settings, ctx| {
+        report_if_error!(settings.provider_registry.set_value(registry, ctx));
+    });
 }
 
 struct AwsBedrockWidget {

@@ -377,6 +377,19 @@ pub struct AmbientAgentsPolicy {
     pub instance_shape: Option<InstanceShape>,
 }
 
+/// Controls which provider kinds and custom endpoints are allowed for team members.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderPolicy {
+    /// Whether direct first-party providers (OpenAI, Anthropic) are allowed.
+    pub allow_direct_providers: AdminEnablementSetting,
+    /// Whether custom compatible endpoints are allowed.
+    pub allow_compatible_endpoints: AdminEnablementSetting,
+    /// If set, only endpoints matching these URL prefixes are allowed.
+    /// Empty means all origins are allowed (when allow_compatible_endpoints is enabled).
+    pub allowed_endpoint_origins: Vec<String>,
+}
+
 #[derive(Clone, Debug, Copy, Serialize, Deserialize)]
 pub struct InstanceShape {
     pub vcpus: i32,
@@ -412,6 +425,7 @@ pub struct Tier {
     pub enterprise_credits_auto_reload_policy: Option<EnterpriseCreditsAutoReloadPolicy>,
     pub multi_admin_policy: Option<MultiAdminPolicy>,
     pub ambient_agents_policy: Option<AmbientAgentsPolicy>,
+    pub provider_policy: Option<ProviderPolicy>,
 }
 
 /// This struct is the rust representation of `BillingMetadata` from the GraphQL Schema.

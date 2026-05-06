@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use ::ai::provider_registry::ProviderRegistry;
 use indexmap::IndexMap;
 
 use crate::ai::request_usage_model::RequestLimitInfo;
@@ -1190,6 +1191,17 @@ define_settings_group!(AISettings, settings: [
         private: false,
         toml_path: "agents.warp_agent.other.should_show_oz_updates_in_zero_state",
         description: "Whether the \"What's new\" section is shown in the agent view.",
+    }
+
+    // Local provider registry metadata for Warp Agent. Secrets are stored by reference only.
+    provider_registry: AIProviderRegistry {
+        type: ProviderRegistry,
+        default: ProviderRegistry::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "ai.provider_registry",
+        description: "Local provider profiles and Warp Agent provider defaults.",
     }
 
     // Whether or not the user has enabled the ability to use Warp credits even when providing
