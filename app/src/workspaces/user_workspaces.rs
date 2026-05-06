@@ -2,7 +2,7 @@ use super::{
     team::{DiscoverableTeam, MembershipRole, Team},
     workspace::{
         AdminEnablementSetting, CustomerType, EnterpriseSecretRegex, HostEnablementSetting,
-        UgcCollectionEnablementSetting, Workspace, WorkspaceUid,
+        ProviderPolicy, UgcCollectionEnablementSetting, Workspace, WorkspaceUid,
     },
 };
 use crate::{
@@ -1469,6 +1469,73 @@ impl UserWorkspaces {
         self.current_team()
             .map(|team| team.organization_settings.enable_warp_attribution.clone())
             .unwrap_or_default()
+    }
+
+    /// Returns the team-level provider policy, if one is set.
+    ///
+    /// Use this to check whether direct providers, custom endpoints, or specific
+    /// endpoint origins are allowed for team members.
+    pub fn provider_policy(&self) -> Option<&ProviderPolicy> {
+        self.current_team()
+            .and_then(|team| team.billing_metadata.tier.provider_policy.as_ref())
+    }
+
+    /// Returns whether direct first-party providers (OpenAI, Anthropic) are allowed.
+    /// Solo users (no team) can always use direct providers.
+    pub fn is_direct_provider_allowed(&self) -> bool {
+        self.current_team().is_none_or(|team| {
+            team.billing_metadata
+                .tier
+                .provider_policy
+                .as_ref()
+                .is_none_or(|policy| {
+                    matches!(
+                        policy.allow_direct_providers,
+                        AdminEnablementSetting::Enable | AdminEnablementSetting::RespectUserSetting
+                    )
+                })
+        })
+    }
+
+    /// Returns whether custom compatible endpoints are allowed.
+    /// Solo users (no team) can always use custom endpoints.
+    pub fn is_compatible_endpoint_allowed(&self) -> bool {
+        self.current_team().is_none_or(|team| {
+            team.billing_metadata
+                .tier
+                .provider_policy
+                .as_ref()
+                .is_none_or(|policy| {
+                    matches!(
+                        policy.allow_compatible_endpoints,
+                        AdminEnablementSetting::Enable | AdminEnablementSetting::RespectUserSetting
+                    )
+                })
+        })
+    }
+
+    /// Checks whether the given endpoint URL is allowed under the team's
+    /// `allowed_endpoint_origins` restriction. Returns `true` if no origin
+    /// restriction is configured (empty list means all origins allowed).
+    pub fn is_endpoint_origin_allowed(&self, endpoint_url: &str) -> bool {
+        self.current_team().is_none_or(|team| {
+            team.billing_metadata
+                .tier
+                .provider_policy
+                .as_ref()
+                .is_none_or(|policy| {
+                    policy.allowed_endpoint_origins.is_empty()
+                        || policy
+                            .allowed_endpoint_origins
+                            .iter()
+                            .any(|prefix| endpoint_url.starts_with(prefix))
+                })
+        })
+    }
+
+    /// Returns whether the user is on a managed team (has an active team).
+    pub fn is_on_managed_team(&self) -> bool {
+        self.current_team().is_some()
     }
 
     /// Returns only the organization-specific codebase context enablement setting.

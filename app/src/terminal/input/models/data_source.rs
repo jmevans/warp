@@ -18,8 +18,8 @@ use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{AppContext, Element, Entity, EntityId, SingletonEntity as _};
 
 use crate::ai::llms::{
-    is_using_api_key_for_provider, DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider,
-    LLMSpec,
+    is_using_api_key_for_provider, provider_for_model_id, provider_registry_with_legacy_keys,
+    DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider, LLMSpec,
 };
 use crate::auth::AuthStateProvider;
 use crate::features::FeatureFlag;
@@ -42,6 +42,227 @@ use super::model_spec_scores::{
     render_model_spec_header, render_model_spec_scores, CostRow, ModelSpecScoresLayout,
     MODEL_SPECS_DESCRIPTION, MODEL_SPECS_TITLE, REASONING_LEVEL_DESCRIPTION, REASONING_LEVEL_TITLE,
 };
+
+/// Visual section grouping for the model picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSection {
+    WarpHosted,
+    OpenAI,
+    Anthropic,
+    LocalCompatible,
+    CustomCompatible,
+    Unknown,
+}
+
+impl ModelSection {
+    fn priority(&self) -> u8 {
+        match self {
+            ModelSection::WarpHosted => 0,
+            ModelSection::OpenAI => 1,
+            ModelSection::Anthropic => 2,
+            ModelSection::LocalCompatible => 3,
+            ModelSection::CustomCompatible => 4,
+            ModelSection::Unknown => 5,
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            ModelSection::WarpHosted => "Warp-hosted",
+            ModelSection::OpenAI => "OpenAI",
+            ModelSection::Anthropic => "Anthropic",
+            ModelSection::LocalCompatible => "Local models",
+            ModelSection::CustomCompatible => "Custom providers",
+            ModelSection::Unknown => "Other",
+        }
+    }
+}
+
+/// Non-selectable section header rendered inline in search results.
+#[derive(Clone)]
+struct SectionHeaderItem {
+    section: ModelSection,
+}
+
+impl SearchItem for SectionHeaderItem {
+    type Action = AcceptModel;
+
+    fn render_item(
+        &self,
+        _highlight_state: ItemHighlightState,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        use warpui::elements::{Flex, ParentElement as _};
+        use warpui::prelude::CrossAxisAlignment;
+
+        let appearance = crate::appearance::Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let font_size = inline_styles::font_size(appearance);
+        let secondary_text_color = inline_styles::secondary_text_color(
+            theme,
+            inline_styles::menu_background_color(app).into(),
+        );
+
+        let section_label = Container::new(
+            Text::new_inline(
+                self.section.display_name().to_string(),
+                appearance.ui_font_family(),
+                font_size,
+            )
+            .with_color(secondary_text_color.into())
+            .with_clip(ClipConfig::ellipsis())
+            .finish(),
+        )
+        .with_padding_top(8.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(section_label)
+            .finish()
+    }
+
+    fn render_icon(
+        &self,
+        _highlight_state: ItemHighlightState,
+        appearance: &crate::appearance::Appearance,
+    ) -> Box<dyn Element> {
+        // Empty spacer to match the icon column width of regular items.
+        let icon_size = inline_styles::font_size(appearance);
+        Container::new(
+            Text::new_inline(" ".to_string(), appearance.ui_font_family(), icon_size).finish(),
+        )
+        .with_margin_right(inline_styles::ICON_MARGIN)
+        .finish()
+    }
+
+    fn is_disabled(&self) -> bool {
+        true
+    }
+
+    fn priority_tier(&self) -> u8 {
+        self.section.priority()
+    }
+
+    fn score(&self) -> OrderedFloat<f64> {
+        OrderedFloat(f64::MIN)
+    }
+
+    fn accept_result(&self) -> Self::Action {
+        unreachable!("section headers are not selectable")
+    }
+
+    fn execute_result(&self) -> Self::Action {
+        unreachable!("section headers are not selectable")
+    }
+
+    fn accessibility_label(&self) -> String {
+        format!("Section: {}", self.section.display_name())
+    }
+}
+
+/// Wraps both section headers and model items in search results.
+#[derive(Clone)]
+enum SearchResultItem {
+    Header(SectionHeaderItem),
+    Model(ModelSearchItem),
+}
+
+impl SearchResultItem {
+    fn section(&self) -> ModelSection {
+        match self {
+            SearchResultItem::Header(h) => h.section,
+            SearchResultItem::Model(m) => m.section(),
+        }
+    }
+}
+
+impl SearchItem for SearchResultItem {
+    type Action = AcceptModel;
+
+    fn render_item(
+        &self,
+        highlight_state: ItemHighlightState,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        match self {
+            SearchResultItem::Header(h) => h.render_item(highlight_state, app),
+            SearchResultItem::Model(m) => m.render_item(highlight_state, app),
+        }
+    }
+
+    fn render_icon(
+        &self,
+        highlight_state: ItemHighlightState,
+        appearance: &crate::appearance::Appearance,
+    ) -> Box<dyn Element> {
+        match self {
+            SearchResultItem::Header(h) => h.render_icon(highlight_state, appearance),
+            SearchResultItem::Model(m) => m.render_icon(highlight_state, appearance),
+        }
+    }
+
+    fn item_background(
+        &self,
+        highlight_state: ItemHighlightState,
+        appearance: &crate::appearance::Appearance,
+    ) -> Option<Fill> {
+        match self {
+            SearchResultItem::Header(_) => None,
+            SearchResultItem::Model(m) => m.item_background(highlight_state, appearance),
+        }
+    }
+
+    fn render_details(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        match self {
+            SearchResultItem::Header(_) => None,
+            SearchResultItem::Model(m) => m.render_details(app),
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        match self {
+            SearchResultItem::Header(h) => h.is_disabled(),
+            SearchResultItem::Model(m) => m.is_disabled(),
+        }
+    }
+
+    fn priority_tier(&self) -> u8 {
+        match self {
+            SearchResultItem::Header(h) => h.priority_tier(),
+            SearchResultItem::Model(m) => m.priority_tier(),
+        }
+    }
+
+    fn score(&self) -> OrderedFloat<f64> {
+        match self {
+            SearchResultItem::Header(h) => h.score(),
+            SearchResultItem::Model(m) => m.score(),
+        }
+    }
+
+    fn accept_result(&self) -> Self::Action {
+        match self {
+            SearchResultItem::Header(h) => h.accept_result(),
+            SearchResultItem::Model(m) => m.accept_result(),
+        }
+    }
+
+    fn execute_result(&self) -> Self::Action {
+        match self {
+            SearchResultItem::Header(h) => h.execute_result(),
+            SearchResultItem::Model(m) => m.execute_result(),
+        }
+    }
+
+    fn accessibility_label(&self) -> String {
+        match self {
+            SearchResultItem::Header(h) => h.accessibility_label(),
+            SearchResultItem::Model(m) => m.accessibility_label(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AcceptModel {
@@ -171,33 +392,48 @@ impl SyncDataSource for ModelSelectorDataSource {
 
         let query_text = query.text.trim().to_lowercase();
 
-        if query_text.is_empty() {
-            return Ok(choices
+        let items: Vec<SearchResultItem> = if query_text.is_empty() {
+            let mut items: Vec<SearchResultItem> = choices
                 .into_iter()
-                .map(|llm| QueryResult::from(ModelSearchItem::new(llm, &active_llm_id, app)))
-                .collect());
-        }
+                .map(|llm| SearchResultItem::Model(ModelSearchItem::new(llm, &active_llm_id, app)))
+                .collect();
+            items.sort_by_key(|item| {
+                (
+                    item.section().priority(),
+                    item.priority_tier(),
+                    item.score(),
+                )
+            });
 
-        Ok(choices
-            .into_iter()
-            .filter_map(|llm| {
-                let match_result = match_indices_case_insensitive(
-                    llm.display_name.to_lowercase().as_str(),
-                    query_text.as_str(),
-                )?;
+            let mut result = Vec::new();
+            for (section, group) in &items.into_iter().chunk_by(|item| item.section()) {
+                result.push(SearchResultItem::Header(SectionHeaderItem { section }));
+                result.extend(group);
+            }
+            result
+        } else {
+            choices
+                .into_iter()
+                .filter_map(|llm| {
+                    let match_result = match_indices_case_insensitive(
+                        llm.display_name.to_lowercase().as_str(),
+                        query_text.as_str(),
+                    )?;
 
-                // Avoid spamming results with extremely weak matches.
-                if query_text.len() > 1 && match_result.score < 10 {
-                    return None;
-                }
+                    if query_text.len() > 1 && match_result.score < 10 {
+                        return None;
+                    }
 
-                Some(QueryResult::from(
-                    ModelSearchItem::new(llm, &active_llm_id, app)
-                        .with_name_match_result(Some(match_result.clone()))
-                        .with_score(OrderedFloat(match_result.score as f64)),
-                ))
-            })
-            .collect())
+                    Some(SearchResultItem::Model(
+                        ModelSearchItem::new(llm, &active_llm_id, app)
+                            .with_name_match_result(Some(match_result.clone()))
+                            .with_score(OrderedFloat(match_result.score as f64)),
+                    ))
+                })
+                .collect()
+        };
+
+        Ok(items.into_iter().map(QueryResult::from).collect())
     }
 }
 
@@ -219,6 +455,8 @@ struct ModelSearchItem {
     manage_api_key_mouse_state: MouseStateHandle,
     reasoning_level: Option<String>,
     discount_percentage: Option<f32>,
+    direct_provider_display_name: Option<String>,
+    direct_provider_is_local: bool,
 }
 
 impl ModelSearchItem {
@@ -232,6 +470,12 @@ impl ModelSearchItem {
         } else {
             llm.disable_reason.clone()
         };
+        let registry = provider_registry_with_legacy_keys(app);
+        let direct_provider = provider_for_model_id(&llm.id, &registry);
+        let direct_provider_display_name =
+            direct_provider.map(|provider| provider.display_name.clone());
+        let direct_provider_is_local =
+            direct_provider.is_some_and(|provider| provider.policy.local_only == Some(true));
         Self {
             id: llm.id.clone(),
             provider: llm.provider.clone(),
@@ -245,6 +489,8 @@ impl ModelSearchItem {
             manage_api_key_mouse_state: Default::default(),
             reasoning_level: llm.reasoning_level(),
             discount_percentage: llm.discount_percentage,
+            direct_provider_display_name,
+            direct_provider_is_local,
         }
     }
 
@@ -256,6 +502,34 @@ impl ModelSearchItem {
     fn with_score(mut self, score: OrderedFloat<f64>) -> Self {
         self.score = score;
         self
+    }
+
+    fn section(&self) -> ModelSection {
+        if let Some(name) = &self.direct_provider_display_name {
+            if self.direct_provider_is_local {
+                return ModelSection::LocalCompatible;
+            }
+            let lower = name.to_lowercase();
+            if lower.contains("openai") {
+                return ModelSection::OpenAI;
+            }
+            if lower.contains("anthropic") || lower.contains("claude") {
+                return ModelSection::Anthropic;
+            }
+            return ModelSection::CustomCompatible;
+        }
+        // Server-provided (Warp-hosted) models have LLMProvider::Unknown but can be
+        // identified by display names like "auto", "auto (cost-efficient)", etc.
+        if self.display_text.to_lowercase().starts_with("auto")
+            || self.display_text.to_lowercase().contains("warp")
+        {
+            return ModelSection::WarpHosted;
+        }
+        match self.provider {
+            LLMProvider::OpenAI => ModelSection::OpenAI,
+            LLMProvider::Anthropic => ModelSection::Anthropic,
+            _ => ModelSection::Unknown,
+        }
     }
 }
 
@@ -337,6 +611,25 @@ impl SearchItem for ModelSearchItem {
                     .with_height(font_size)
                     .finish();
             row = row.with_child(Container::new(key_icon).with_margin_left(6.).finish());
+        }
+
+        if let Some(provider_display_name) = &self.direct_provider_display_name {
+            let provider_text = if self.direct_provider_is_local {
+                format!("via {provider_display_name} (local)")
+            } else {
+                format!("via {provider_display_name}")
+            };
+            let provider_label =
+                Text::new_inline(provider_text, appearance.ui_font_family(), font_size)
+                    .with_color(secondary_text_color.into())
+                    .finish();
+            row = row.with_child(Container::new(provider_label).with_margin_left(6.).finish());
+        } else {
+            let provider_label =
+                Text::new_inline("via Warp", appearance.ui_font_family(), font_size)
+                    .with_color(secondary_text_color.into())
+                    .finish();
+            row = row.with_child(Container::new(provider_label).with_margin_left(6.).finish());
         }
 
         if self.is_selected {
@@ -424,8 +717,9 @@ impl SearchItem for ModelSearchItem {
         };
         let header = render_model_spec_header(title, description, app);
 
+        let is_using_direct_provider = self.direct_provider_display_name.is_some();
         let is_using_api_key = is_using_api_key_for_provider(&self.provider, app);
-        let cost_row = if is_using_api_key {
+        let cost_row = if is_using_direct_provider || is_using_api_key {
             let manage_button = appearance
                 .ui_builder()
                 .button(

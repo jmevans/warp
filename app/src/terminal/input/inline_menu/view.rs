@@ -581,11 +581,13 @@ impl<A: InlineMenuAction, T: 'static + Send + Sync> InlineMenuView<A, T> {
         self.details_pane_target = DetailsPaneTarget::Selection;
         self.scroll_to_selected_idx(ctx);
         if let Some(result_renderer) = self.result_renderers.get(idx) {
-            let item = result_renderer.search_result.accept_result();
-            self.model.update(ctx, |model, ctx| {
-                model.update_selected_item(item.clone(), ctx);
-            });
-            ctx.emit(InlineMenuEvent::SelectedItem { item });
+            if !result_renderer.search_result.is_disabled() {
+                let item = result_renderer.search_result.accept_result();
+                self.model.update(ctx, |model, ctx| {
+                    model.update_selected_item(item.clone(), ctx);
+                });
+                ctx.emit(InlineMenuEvent::SelectedItem { item });
+            }
         }
         ctx.notify();
     }
@@ -596,6 +598,9 @@ impl<A: InlineMenuAction, T: 'static + Send + Sync> InlineMenuView<A, T> {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         for (idx, renderer) in self.result_renderers.iter().enumerate() {
+            if renderer.search_result.is_disabled() {
+                continue;
+            }
             let action = renderer.search_result.accept_result();
             if predicate(&action) {
                 self.select_idx(idx, ctx);
@@ -611,6 +616,9 @@ impl<A: InlineMenuAction, T: 'static + Send + Sync> InlineMenuView<A, T> {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         for idx in (0..self.result_renderers.len()).rev() {
+            if self.result_renderers[idx].search_result.is_disabled() {
+                continue;
+            }
             let action = self.result_renderers[idx].search_result.accept_result();
             if predicate(&action) {
                 self.select_idx(idx, ctx);

@@ -145,7 +145,7 @@ use ai::agent_management::AgentNotificationsModel;
 use ai::ambient_agents::scheduled::ScheduledAgentManager;
 use ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use ai::execution_profiles::editor::ExecutionProfileEditorManager;
-use ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use ai::execution_profiles::profiles::{AIExecutionProfilesModel, AIExecutionProfilesModelEvent};
 use ai::persisted_workspace::PersistedWorkspace;
 use auth::auth_state::AuthStateProvider;
 use auth::{auth_manager::AuthManager, auth_state::AuthState};
@@ -1817,6 +1817,20 @@ fn initialize_app(
     }
 
     ctx.add_singleton_model(|ctx| AIExecutionProfilesModel::new(launch_mode, ctx));
+
+    // Subscribe to profile events so LLMPreferences can cache BYO profile base_model info.
+    let llm_prefs_handle = LLMPreferences::handle(ctx);
+    ctx.subscribe_to_model(&AIExecutionProfilesModel::handle(ctx), move |_, event, ctx| {
+        if matches!(
+            event,
+            AIExecutionProfilesModelEvent::ProfileUpdated(_)
+                | AIExecutionProfilesModelEvent::UpdatedActiveProfile { .. }
+        ) {
+            llm_prefs_handle.update(ctx, |prefs, ctx| {
+                prefs.refresh_profile_base_model_cache(ctx);
+            });
+        }
+    });
 
     ctx.add_singleton_model(DefaultTerminal::new);
 

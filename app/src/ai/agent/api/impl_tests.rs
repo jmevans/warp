@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use crate::ai::agent::api::RequestParams;
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::LLMId;
+use ::ai::provider_registry::ProviderRegistry;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
@@ -8,6 +11,8 @@ use super::get_supported_tools;
 
 fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool) -> RequestParams {
     let model = LLMId::from("test-model");
+    let resolved_provider =
+        ProviderRegistry::default().resolve_agent_provider(Some(model.as_str()));
 
     RequestParams {
         input: vec![],
@@ -28,7 +33,10 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         mcp_context: None,
         planning_enabled: true,
         should_redact_secrets: false,
+        resolved_provider,
+        original_provider_id: None,
         api_keys: None,
+        legacy_api_keys: Default::default(),
         allow_use_of_warp_credits_with_byok: false,
         autonomy_level: api::AutonomyLevel::Supervised,
         isolation_level: api::IsolationLevel::None,
@@ -40,6 +48,9 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         supported_tools_override: None,
         parent_agent_id: None,
         agent_name: None,
+        resolve_secret: Arc::new(|_| None),
+        conversation_history: Vec::new(),
+        mcp_tool_executor: None,
     }
 }
 

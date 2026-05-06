@@ -1,19 +1,27 @@
 pub(crate) mod convert_conversation;
 mod convert_from;
 mod convert_to;
+mod direct_provider;
 mod r#impl;
+
+use std::collections::HashMap;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;
+use ai::provider_registry::{ProviderResolutionError, ResolvedProvider};
 pub use convert_from::{
     user_inputs_from_messages, ConversionParams, ConvertAPIMessageToClientOutputMessage,
     MaybeAIAgentOutputMessage, MessageToAIAgentOutputMessageError,
 };
+pub use direct_provider::{AgentExchangeSnapshot, SerializedImage};
 
 pub use r#impl::generate_multi_agent_output;
 
 use futures_lite::Stream;
+use futures_util::future::BoxFuture;
 use serde::Serialize;
+use serde_json::Value;
+use settings::Setting as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +37,8 @@ use crate::{
 };
 
 use super::{AIAgentInput, MCPContext, MCPServer, RequestMetadata, Suggestions};
+use warpui_extras::secure_storage::AppContextExt;
+
 use crate::ai::blocklist::{BlocklistAIPermissions, RequestInput};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::mcp::templatable_manager::TemplatableMCPServerInfo;
@@ -93,7 +103,8 @@ impl TryFrom<ServerConversationToken>
     }
 }
 
-#[derive(Debug, Clone)]
+#[allow(missing_debug_implementations, clippy::type_complexity)]
+#[derive(Clone)]
 pub struct RequestParams {
     pub input: Vec<AIAgentInput>,
     pub conversation_token: Option<ServerConversationToken>,
@@ -114,9 +125,15 @@ pub struct RequestParams {
     pub mcp_context: Option<MCPContext>,
     pub planning_enabled: bool,
     should_redact_secrets: bool,
+    pub resolved_provider: Result<ResolvedProvider, ProviderResolutionError>,
+
+    /// The provider ID from the original request's model ID, preserved even if
+    /// provider resolution fails (e.g. provider was deleted mid-conversation).
+    pub original_provider_id: Option<String>,
 
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
+    pub legacy_api_keys: ai::api_keys::ApiKeys,
     pub allow_use_of_warp_credits_with_byok: bool,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
@@ -130,6 +147,16 @@ pub struct RequestParams {
     pub parent_agent_id: Option<String>,
     /// The display name for this agent (e.g. "Agent 1"), assigned by the orchestrator.
     pub agent_name: Option<String>,
+    /// Resolves a secret reference (e.g. keychain path or env var name) to its value.
+    /// Populated at construction time from secure storage + env, so the stream can
+    /// resolve secrets without holding an `AppContext`.
+    pub resolve_secret: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
+
+    /// Previous exchanges in the conversation, serialized for direct-provider message history.
+    pub conversation_history: Vec<AgentExchangeSnapshot>,
+
+    /// Executes MCP tool calls in direct-provider mode.
+    pub mcp_tool_executor: Option<Arc<dyn McpToolExecutor>>,
 }
 
 pub type Event = Result<warp_multi_agent_api::ResponseEvent, Arc<AIApiError>>;
@@ -235,7 +262,34 @@ impl RequestParams {
         let should_redact_secrets = get_secret_obfuscation_mode(app).should_redact_secret();
 
         let user_workspaces = UserWorkspaces::as_ref(app);
-        let api_keys = ApiKeyManager::as_ref(app).api_keys_for_request(
+        let api_key_manager = ApiKeyManager::as_ref(app);
+        let legacy_api_keys = api_key_manager.keys().clone();
+        let provider_registry = api_key_manager.provider_registry_from_legacy_keys(Some(
+            ai_settings.provider_registry.value().clone(),
+        ));
+
+        let original_provider_id =
+            ai::provider_registry::ProviderQualifiedModelId::parse(request_input.model_id.as_str())
+                .map(|parsed| parsed.provider_id);
+
+        let resolved_provider =
+            provider_registry.resolve_agent_provider(Some(request_input.model_id.as_str()));
+        let resolved_provider = resolved_provider.and_then(|resolved| {
+            let is_direct_allowed = user_workspaces.is_direct_provider_allowed();
+            let is_compatible_allowed = user_workspaces.is_compatible_endpoint_allowed();
+            let is_endpoint_origin_allowed =
+                user_workspaces.is_endpoint_origin_allowed(&resolved.base_url);
+            let is_managed_team = user_workspaces.is_on_managed_team();
+            resolved
+                .validate_team_policy(
+                    is_direct_allowed,
+                    is_compatible_allowed,
+                    is_endpoint_origin_allowed,
+                    is_managed_team,
+                )
+                .map(|_| resolved)
+        });
+        let api_keys = api_key_manager.api_keys_for_request(
             user_workspaces.is_byo_api_key_enabled(),
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
@@ -301,6 +355,24 @@ impl RequestParams {
                 })
         };
 
+        // Build a secret resolver: snapshot keychain values now (SecureStorage isn't Send),
+        // and resolve env vars at request time.
+        let secure_storage = app.secure_storage();
+        let keychain_cache: HashMap<String, String> = resolved_provider
+            .as_ref()
+            .ok()
+            .and_then(|p| resolve_keychain_refs(secure_storage, &p.auth))
+            .unwrap_or_default();
+        let resolve_secret = Arc::new(move |ref_: &str| -> Option<String> {
+            if let Some(value) = keychain_cache.get(ref_) {
+                return Some(value.clone());
+            }
+            if ref_.starts_with("legacy://") {
+                return None;
+            }
+            std::env::var(ref_).ok()
+        });
+
         Self {
             input: request_input.all_inputs().cloned().collect(),
             conversation_token: conversation.server_conversation_token,
@@ -320,7 +392,10 @@ impl RequestParams {
             mcp_context,
             planning_enabled: true,
             should_redact_secrets,
+            resolved_provider,
+            original_provider_id,
             api_keys,
+            legacy_api_keys,
             allow_use_of_warp_credits_with_byok,
             autonomy_level,
             isolation_level,
@@ -332,6 +407,48 @@ impl RequestParams {
             supported_tools_override: request_input.supported_tools_override.clone(),
             parent_agent_id: None,
             agent_name: None,
+            resolve_secret,
+            conversation_history: Vec::new(),
+            mcp_tool_executor: None,
         }
     }
+}
+
+/// Extract keychain-referenced secrets from secure storage at construction time
+/// so the resolver closure can be `Send + Sync`.
+fn resolve_keychain_refs(
+    secure_storage: &dyn warpui_extras::secure_storage::SecureStorage,
+    auth: &ai::provider_registry::ResolvedAuth,
+) -> Option<HashMap<String, String>> {
+    let (ref_, key) = match auth {
+        ai::provider_registry::ResolvedAuth::KeychainBearerToken { secret_ref } => {
+            let key = secure_storage.read_value(secret_ref).ok()?;
+            (secret_ref.clone(), key)
+        }
+        ai::provider_registry::ResolvedAuth::KeychainApiKey { secret_ref } => {
+            let ref_ = secret_ref.as_ref()?;
+            if !ref_.starts_with("keychain://") {
+                return None;
+            }
+            let key = secure_storage.read_value(ref_).ok()?;
+            (ref_.clone(), key)
+        }
+        ai::provider_registry::ResolvedAuth::EnvApiKey { .. }
+        | ai::provider_registry::ResolvedAuth::None => return None,
+    };
+    let mut map = HashMap::new();
+    map.insert(ref_, key);
+    Some(map)
+}
+
+/// Async executor for MCP tool calls in direct-provider mode.
+///
+/// Implemented by capturing the `TemplatableMCPServerManager` at `RequestParams`
+/// construction time, so the stream can execute tools without holding an `AppContext`.
+pub trait McpToolExecutor: Send + Sync {
+    fn execute(
+        &self,
+        tool_name: String,
+        arguments: serde_json::Map<String, Value>,
+    ) -> BoxFuture<'static, Result<String, String>>;
 }

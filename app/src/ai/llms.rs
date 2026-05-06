@@ -1,5 +1,10 @@
+use ::ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent};
+use ::ai::provider_registry::{
+    ProviderKind, ProviderQualifiedModelId, ProviderRegistry, WARP_HOSTED_PROVIDER_ID,
+};
 use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
+use settings::Setting as _;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
@@ -16,6 +21,7 @@ use crate::{
     network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind},
     report_error,
     server::server_api::ServerApiProvider,
+    settings::{AISettings, AISettingsChangedEvent},
     workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent},
 };
 
@@ -524,11 +530,18 @@ pub struct LLMPreferences {
     // from the base LLM for the active profile. This means that if the user selects the
     // profile's default model and changes their profile, the model will update to that profile's default.
     base_llm_for_terminal_view: HashMap<EntityId, LLMId>,
+    // Cached LLMInfo for overrides, used when local_provider_agent_choices isn't populated yet.
+    base_llm_info_cache: HashMap<EntityId, LLMInfo>,
+    // Cached LLMInfo keyed by model ID, used to resolve profile base_model for BYO providers
+    // when the catalog hasn't loaded or doesn't contain the model.
+    base_llm_info_by_id: HashMap<LLMId, LLMInfo>,
+    local_provider_agent_choices: Vec<LLMInfo>,
 }
 
 impl LLMPreferences {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let models_by_feature = get_cached_models(ctx).unwrap_or_default();
+        let local_provider_agent_choices = local_provider_agent_choices(ctx);
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -554,13 +567,28 @@ impl LLMPreferences {
                 me.refresh_authed_models(ctx);
             }
         });
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |me, event, ctx| {
+            if matches!(event, AISettingsChangedEvent::AIProviderRegistry { .. }) {
+                me.refresh_local_provider_agent_choices(ctx);
+            }
+        });
+        ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |me, event, ctx| {
+            if matches!(event, ApiKeyManagerEvent::KeysUpdated) {
+                me.refresh_local_provider_agent_choices(ctx);
+            }
+        });
 
         let base_llm_for_terminal_view = HashMap::new();
+        let base_llm_info_cache = HashMap::new();
+        let base_llm_info_by_id = HashMap::new();
 
         let me = Self {
             models_by_feature,
             last_update: None,
             base_llm_for_terminal_view,
+            base_llm_info_cache,
+            base_llm_info_by_id,
+            local_provider_agent_choices,
         };
 
         // In agent mode eval builds, eagerly kick off a fetch of the model list from the server
@@ -591,20 +619,38 @@ impl LLMPreferences {
         if let Some(terminal_view_id) = terminal_view_id {
             let raw_override = self.base_llm_for_terminal_view.get(&terminal_view_id);
             if let Some(llm_id) = raw_override {
-                if let Some(llm_info) = self.models_by_feature.agent_mode.info_for_id(llm_id) {
+                // First try to resolve from the current model catalog.
+                if let Some(llm_info) = self.agent_mode_info_for_id(llm_id) {
                     return llm_info;
+                }
+                // Catalog lookup failed (e.g., local providers not yet loaded).
+                // Fall back to the cached LLMInfo from when the override was set.
+                if let Some(cached) = self.base_llm_info_cache.get(&terminal_view_id) {
+                    return cached;
                 }
             }
         }
 
         let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
 
-        profile
-            .data()
-            .base_model
-            .clone()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(&id))
-            .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
+        if let Some(ref base_model_id) = profile.data().base_model {
+            // Try catalog lookup first.
+            if let Some(llm_info) = self.agent_mode_info_for_id(base_model_id) {
+                return llm_info;
+            }
+            // Catalog lookup failed. Check the model-ID-keyed cache for BYO providers.
+            if let Some(info) = self.base_llm_info_by_id.get(base_model_id) {
+                return info;
+            }
+            // Also scan terminal-override cache entries as a secondary fallback.
+            for info in self.base_llm_info_cache.values() {
+                if &info.id == base_model_id {
+                    return info;
+                }
+            }
+        }
+
+        self.models_by_feature.agent_mode.default_llm_info()
     }
 
     pub fn get_active_coding_model<'a>(
@@ -639,6 +685,7 @@ impl LLMPreferences {
             .choices
             .iter()
             .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            .chain(self.local_provider_agent_choices.iter())
     }
 
     /// Returns the set of LLMs available for coding.
@@ -653,7 +700,7 @@ impl LLMPreferences {
 
     /// Returns the set of LLMs available for CLI agent.
     pub fn get_cli_agent_llm_choices(&self) -> impl Iterator<Item = &LLMInfo> {
-        self.get_cli_agent_available().choices.iter()
+        self.get_cli_agent_available().choices.iter().chain(self.local_provider_agent_choices.iter())
     }
 
     /// Returns the `LLMInfo` for the CLI agent model.
@@ -725,7 +772,11 @@ impl LLMPreferences {
 
     /// Returns metadata about an LLM, if the client knows about it.
     pub fn get_llm_info(&self, id: &LLMId) -> Option<&LLMInfo> {
-        self.models_by_feature.info_for_id(id)
+        self.models_by_feature.info_for_id(id).or_else(|| {
+            self.local_provider_agent_choices
+                .iter()
+                .find(|info| &info.id == id)
+        })
     }
 
     /// Returns the default base model as a fallback.
@@ -766,7 +817,7 @@ impl LLMPreferences {
             .data()
             .base_model
             .as_ref()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(id))
+            .and_then(|id| self.agent_mode_info_for_id(id))
             .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
             .id
             .clone();
@@ -777,7 +828,14 @@ impl LLMPreferences {
             self.base_llm_for_terminal_view
                 .remove(&terminal_view_id)
                 .is_some()
+                | self.base_llm_info_cache.remove(&terminal_view_id).is_some()
         } else {
+            // Cache the LLMInfo so it's available even if catalog isn't loaded yet.
+            // If catalog lookup fails, create a synthetic LLMInfo from the ID.
+            let info = self.agent_mode_info_for_id(preferred_llm_id)
+                .cloned()
+                .unwrap_or_else(|| Self::synthetic_llm_info(preferred_llm_id));
+            self.base_llm_info_cache.insert(terminal_view_id, info);
             self.base_llm_for_terminal_view
                 .insert(terminal_view_id, preferred_llm_id.clone());
             true
@@ -956,10 +1014,8 @@ impl LLMPreferences {
                     let effective_base_model_id = preferred_base_model
                         .as_ref()
                         .unwrap_or(&self.models_by_feature.agent_mode.default_id);
-                    let effective_base_model_info = self
-                        .models_by_feature
-                        .agent_mode
-                        .info_for_id(effective_base_model_id);
+                    let effective_base_model_info =
+                        self.agent_mode_info_for_id(effective_base_model_id);
                     let effective_base_model_missing = effective_base_model_info.is_none();
                     let effective_base_model_is_configurable = effective_base_model_info
                         .is_some_and(|info| info.context_window.is_configurable);
@@ -1050,9 +1106,85 @@ impl LLMPreferences {
         ctx: &mut ModelContext<Self>,
     ) {
         let old = self.base_llm_for_terminal_view.remove(&terminal_view_id);
+        self.base_llm_info_cache.remove(&terminal_view_id);
         if old.is_some() {
             self.trigger_snapshot_save(ctx);
             ctx.emit(LLMPreferencesEvent::UpdatedActiveAgentModeLLM);
+        }
+    }
+
+    fn agent_mode_info_for_id(&self, id: &LLMId) -> Option<&LLMInfo> {
+        self.models_by_feature
+            .agent_mode
+            .info_for_id(id)
+            .or_else(|| {
+                self.local_provider_agent_choices
+                    .iter()
+                    .find(|info| &info.id == id)
+            })
+    }
+
+    /// Populate the model-ID-keyed cache for the profile's base_model if it's a BYO provider
+    /// model that can't be resolved from the catalog. This ensures the correct model info
+    /// is available even before local_provider_agent_choices are fully loaded.
+    pub fn refresh_profile_base_model_cache(&mut self, ctx: &mut ModelContext<Self>) {
+        let profile = AIExecutionProfilesModel::as_ref(ctx)
+            .active_profile(None, ctx);
+        if let Some(ref base_model_id) = profile.data().base_model {
+            if self.agent_mode_info_for_id(base_model_id).is_none() {
+                self.base_llm_info_by_id
+                    .insert(base_model_id.clone(), Self::synthetic_llm_info(base_model_id));
+            }
+        }
+    }
+
+    fn refresh_local_provider_agent_choices(&mut self, ctx: &mut ModelContext<Self>) {
+        let choices = local_provider_agent_choices(ctx);
+        if self.local_provider_agent_choices != choices {
+            self.local_provider_agent_choices = choices;
+            // Update cache entries that can now be resolved from the refreshed catalog.
+            for (view_id, llm_id) in &self.base_llm_for_terminal_view {
+                if let Some(info) = self.agent_mode_info_for_id(llm_id) {
+                    self.base_llm_info_cache.insert(*view_id, info.clone());
+                }
+            }
+            // Re-check profile base_model now that local providers are loaded.
+            self.refresh_profile_base_model_cache(ctx);
+            ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+        } else {
+            // Even if local_provider_agent_choices didn't change, the profile base_model
+            // might still need caching (e.g., at startup when no terminal override exists).
+            self.refresh_profile_base_model_cache(ctx);
+        }
+    }
+
+    /// Creates a synthetic LLMInfo from an LLMId when the catalog lookup fails.
+    /// Used for BYO provider models that aren't yet in the loaded catalog.
+    fn synthetic_llm_info(id: &LLMId) -> LLMInfo {
+        // Parse qualified model ID (e.g., "lmstudio:google/gemma-4-26-a4")
+        let parts: Vec<&str> = id.as_str().splitn(2, ':').collect();
+        let (display_name, description) = if parts.len() == 2 {
+            (parts[1].to_string(), Some(parts[0].to_string()))
+        } else {
+            (id.as_str().to_string(), None)
+        };
+        LLMInfo {
+            display_name,
+            base_model_name: id.as_str().to_string(),
+            id: id.clone(),
+            reasoning_level: None,
+            usage_metadata: LLMUsageMetadata {
+                request_multiplier: 1,
+                credit_multiplier: None,
+            },
+            description,
+            disable_reason: None,
+            vision_supported: false,
+            spec: None,
+            provider: LLMProvider::Unknown,
+            host_configs: HashMap::new(),
+            discount_percentage: None,
+            context_window: LLMContextWindow::default(),
         }
     }
 }
@@ -1110,6 +1242,56 @@ fn get_cached_models(app: &mut AppContext) -> Option<ModelsByFeature> {
             }
         }
     }
+}
+
+fn local_provider_agent_choices(app: &AppContext) -> Vec<LLMInfo> {
+    provider_registry_with_legacy_keys(app)
+        .enabled_model_choices()
+        .into_iter()
+        .filter(|choice| choice.qualified_id.provider_id != WARP_HOSTED_PROVIDER_ID)
+        .map(|choice| {
+            let id = LLMId::from(choice.qualified_id.to_string());
+            let provider = match choice.provider_kind {
+                ProviderKind::OpenAI | ProviderKind::OpenAICompatible => LLMProvider::OpenAI,
+                ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => {
+                    LLMProvider::Anthropic
+                }
+                ProviderKind::WarpHosted => LLMProvider::Unknown,
+            };
+            LLMInfo {
+                display_name: choice.model_id.clone(),
+                base_model_name: choice.model_id,
+                id,
+                reasoning_level: None,
+                usage_metadata: LLMUsageMetadata {
+                    request_multiplier: 1,
+                    credit_multiplier: None,
+                },
+                description: Some(choice.provider_display_name),
+                disable_reason: None,
+                vision_supported: false,
+                spec: None,
+                provider,
+                host_configs: HashMap::new(),
+                discount_percentage: None,
+                context_window: LLMContextWindow::default(),
+            }
+        })
+        .collect()
+}
+
+pub fn provider_registry_with_legacy_keys(app: &AppContext) -> ProviderRegistry {
+    ApiKeyManager::as_ref(app).provider_registry_from_legacy_keys(Some(
+        AISettings::as_ref(app).provider_registry.value().clone(),
+    ))
+}
+
+pub fn provider_for_model_id<'a>(
+    model_id: &LLMId,
+    registry: &'a ProviderRegistry,
+) -> Option<&'a ::ai::provider_registry::ProviderProfile> {
+    let qualified = ProviderQualifiedModelId::parse(model_id.as_str())?;
+    registry.providers.get(&qualified.provider_id)
 }
 
 #[cfg(test)]
